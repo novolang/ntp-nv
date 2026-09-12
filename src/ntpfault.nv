@@ -1,0 +1,125 @@
+// ntpfault.nv — what an SNTP exchange can answer other than a time.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.
+//
+// THE LIST IS RFC 4330 § 5's, AND IT IS A LIST BECAUSE EVERY ITEM ON IT
+// IS A REPLY THAT LOOKS FINE.  A forty-eight byte datagram that parses,
+// carries a plausible timestamp and came from the right address can
+// still be: a packet the client must not use because the server itself
+// is not synchronised; a packet from a server that has told this client
+// to go away; or a packet an off-path attacker sent.  A client that
+// only checked "did it parse" sets the clock from all three.
+
+// A kiss-o'-death code: what a stratum-0 reply's reference id says.
+//
+// Stratum 0 is not a stratum.  It means the four bytes that would hold
+// a reference identifier are four ASCII characters of instruction
+// instead, and the ones that matter are about whether this client may
+// ever ask again.  A client that ignored them is the client that gets
+// an address range banned from the public pool, which is the failure
+// mode the pool operators actually see.
+pub enum NtpKiss
+    // Access denied permanently.  Stop, and do not retry — not with a
+    // backoff, not tomorrow.
+    NtpKissDeny
+    // Access denied by a restriction list.  Same rule as `DENY`.
+    NtpKissRstr
+    // The client is polling too fast.  Back off: double the interval
+    // and keep it doubled, because the server is counting.
+    NtpKissRate
+    // The server is not synchronised and is saying so in words as well
+    // as in the leap indicator.
+    NtpKissInit
+    // The association was replaced or the server is going away.
+    NtpKissStep
+    // Any other four characters, carried as they arrived.  New codes
+    // are registered regularly and an unknown one is still a refusal.
+    NtpKissOther(code: Str)
+
+// Why a reply cannot be used.
+pub enum NtpFault
+    // Fewer than forty-eight bytes, or a version this client does not
+    // speak.
+    NtpFaultShortPacket(got: Int)
+    // The version field named something outside 3 or 4.
+    NtpFaultBadVersion(version: Int)
+    // The mode was not 4.  A client that accepted mode 3 accepted
+    // another client's REQUEST reflected back at it, which is what a
+    // trivial amplification test looks like from the inside.
+    NtpFaultNotAServerReply(mode: Int)
+    // THE ANTI-SPOOFING CHECK.  The reply's originate timestamp is not
+    // the transmit timestamp this client sent.  That field is the only
+    // thing in SNTP that an off-path attacker cannot know, and a client
+    // that skipped this check accepts the first forged reply to arrive
+    // — which, on an open network, is every reply.
+    NtpFaultNonceMismatch
+    // The transmit timestamp is zero: the server answered without
+    // having a time to give.
+    NtpFaultZeroTransmit
+    // The leap indicator is 3, which means the server's own clock is
+    // not synchronised.  Not an error at the server; a refusal here.
+    NtpFaultUnsynchronised
+    // Stratum 0 with a kiss code.
+    NtpFaultKiss(kiss: NtpKiss)
+    // Stratum above 15, which RFC 5905 reserves.
+    NtpFaultBadStratum(stratum: Int)
+    // The root delay and root dispersion say the server's own error is
+    // larger than the caller's tolerance, so its answer is worse than
+    // no answer.
+    NtpFaultTooDispersed(max_error_micros: Int)
+    // The round-trip delay is longer than the caller's tolerance: the
+    // offset computed from it cannot be more accurate than half of it.
+    NtpFaultTooSlow(delay_micros: Int)
+    // The socket failed.
+    NtpFaultTransport(detail: Str)
+    // No reply arrived inside the timeout.
+    NtpFaultTimeout(server: Str)
+    // Every server in the list failed.
+    NtpFaultNoServerAnswered(tried: Int)
+
+// The four characters a kiss code is written as on the wire.
+pub fn kiss_text(k: NtpKiss) -> Str []
+    todo("ntp-nv.ntpfault.kiss_text")
+
+// The kiss code four bytes of reference id name.
+//
+// ```novo
+// use ntpfault
+//
+// fn stop(code: Str) -> Bool
+//     ntpfault.kiss_stops_forever(ntpfault.kiss_of_text(code))
+// ```
+pub fn kiss_of_text(code: Str) -> NtpKiss []
+    todo("ntp-nv.ntpfault.kiss_of_text")
+
+// Whether a kiss code means "never ask this server again".
+//
+// `DENY` and `RSTR` do; `RATE` means back off and keep going.  The
+// difference is the whole of the client's obligation, and getting it
+// backwards in either direction is bad: treating `RATE` as permanent
+// loses a working server, and treating `DENY` as temporary is what
+// gets an address range banned.
+pub fn kiss_stops_forever(k: NtpKiss) -> Bool []
+    todo("ntp-nv.ntpfault.kiss_stops_forever")
+
+// Whether a fault is worth trying another server for.
+//
+// A timeout and a transport failure are; a kiss code that stops
+// forever is not, for THIS server, and `ntppool.without` is how it
+// leaves the list.
+pub fn try_another(f: NtpFault) -> Bool []
+    todo("ntp-nv.ntpfault.try_another")
+
+// What went wrong, in one line.
+//
+// ```novo
+// use ntpfault
+//
+// fn report(f: NtpFault) -> Str
+//     f.message()
+// ```
+impl Error for NtpFault
+    fn message(self) -> Str
+        todo("ntp-nv.ntpfault.NtpFault.message")

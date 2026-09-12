@@ -1,0 +1,135 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A SENSOR WITH A RADIO AND NO BATTERY-BACKED CLOCK.
+// It wakes, sends forty-eight bytes, gets forty-eight back, and needs
+// one number out of them: how far its own counter is from the time.
+// Everything that answer needs is integer arithmetic over two
+// thirty-two bit halves, and this program is that arithmetic run on the
+// hardware rather than a sentence claiming it would run.
+//
+// WHAT IS NOT HERE, AND WHY.  Nothing that names a `Str`, a `[u8]` or
+// calendar-nv's `CivilDateTime`.  A firmware holds the packet's fields
+// and adds an offset to its own counter; the civil date is the host's
+// problem, `ntpcalc.civil_of` is the one function in the package that
+// names one, and a probe can only be built against this package's own
+// modules today.  `ntpfault`, `ntppool` and `ntpclient` are out for the
+// same reason a host module is always out of an embedded build: one
+// host-only function anywhere in a compilation unit is an undefined
+// symbol at link time whether or not the firmware calls it.
+//
+// The four timestamps are the arithmetic that matters and the 2036 era
+// rule is the part most likely to be lowered differently on a 32-bit
+// core, which is why both are here.
+
+use std.str
+use ntppkt
+use ntpcalc
+
+// A reply's four timestamps, built the way firmware builds them: from
+// numbers it already holds, with nothing allocated to stage them.
+//
+// The values are one second of round trip around a server that is two
+// seconds ahead, so the offset and the delay are both numbers a reader
+// can check by hand.
+@tier(rt)
+fn an_exchange() -> NtpExchange
+    let t1: NtpTimestamp = ntppkt.timestamp(3900000000, 0)
+    let t2: NtpTimestamp = ntppkt.timestamp(3900000002, 0)
+    let t3: NtpTimestamp = ntppkt.timestamp(3900000002, 0)
+    let t4: NtpTimestamp = ntppkt.timestamp(3900000001, 0)
+    ntpcalc.exchange(t1, t2, t3, t4)
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+//
+// A firmware image has one line of output; making it depend on all of
+// them is what stops a passing run from meaning "the first assertion
+// held".
+@tier(rt)
+fn score() -> Int
+    var n = 0
+
+    // The timestamp type itself: construction, the zero, and the
+    // sixty-four bit comparison the anti-spoofing check is.
+    let z: NtpTimestamp = ntppkt.zero_timestamp()
+    if ntppkt.timestamp_is_zero(z)
+        n = n + 1
+    let a: NtpTimestamp = ntppkt.timestamp(3900000000, 2147483648)
+    if not ntppkt.timestamp_is_zero(a)
+        n = n + 1
+    if ntppkt.timestamp_eq(a, ntppkt.timestamp(3900000000, 2147483648))
+        n = n + 1
+    if not ntppkt.timestamp_eq(a, ntppkt.timestamp(3900000000, 0))
+        n = n + 1
+
+    // The 2^-32 fraction as microseconds: half a second is five hundred
+    // thousand, and getting the scale wrong is a factor of 4295.
+    if ntpcalc.fraction_micros(a) == 500000
+        n = n + 1
+
+    // THE ERA RULE, which is the reason this probe exists as much as
+    // the linking is.  The high bit of the seconds field decides which
+    // seventy years the timestamp is in, and a 32-bit core is where a
+    // shift of a 64-bit value is most likely to be lowered wrongly.
+    if ntpcalc.era_of(a) == 0
+        n = n + 1
+    if ntpcalc.era_of(ntppkt.timestamp(1000000, 0)) == 1
+        n = n + 1
+
+    // And the subtraction that era rule guards.
+    if ntpcalc.unix_seconds_of(ntppkt.timestamp(3900000000, 0)) == 1691011200
+        n = n + 1
+
+    // The offset and the delay, over an exchange a reader can check by
+    // hand: the server is two seconds ahead and the round trip is one.
+    let e: NtpExchange = an_exchange()
+    if ntpcalc.offset_micros(e) == 2500000
+        n = n + 1
+    if ntpcalc.delay_micros(e, 1) == 1000000
+        n = n + 1
+    if not ntpcalc.delay_was_clamped(e, 1)
+        n = n + 1
+
+    // A request built from a nonce, which is the one packet a device
+    // constructs.
+    let req: NtpPacket = ntppkt.request(a)
+    if req.mode == ntppkt.NTP_MODE_CLIENT
+        n = n + 1
+    if req.version == ntppkt.NTP_VERSION
+        n = n + 1
+    if not ntppkt.is_kiss(req)
+        n = n + 1
+
+    // The two fixed-point scales, kept apart.  Root delay and root
+    // dispersion are 16.16 and the timestamps are 32.32, and one field
+    // read at the other's scale is out by 65536.
+    if ntppkt.root_delay_micros(req) == 0
+        n = n + 1
+    if ntppkt.server_error_micros(req) == 0
+        n = n + 1
+
+    // The signed powers of two, which are the two fields a firmware
+    // author most often reads as unsigned.
+    if ntppkt.poll_seconds(req) >= 0
+        n = n + 1
+    if ntppkt.precision_micros(req) >= 0
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 18 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says HOW MANY it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 18
+        hal.uart.write("PASS: ntp-embedded\n")
+    else
+        hal.uart.write("FAIL: ntp-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        core.rt.sleep_ms(1000)

@@ -1,0 +1,255 @@
+// ntppkt.nv — the forty-eight bytes, and the two fixed-point scales
+// they mix.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT, AND `@tier(embedded)` ON THE ARITHMETIC.  A sensor
+// with a radio and no battery-backed clock is the consumer that makes
+// this claim real: it holds forty-eight bytes and does integer
+// arithmetic over them, and it cannot link anything that allocates.
+// `tests/embedded_probe.nv` is that claim as a program.
+//
+// TWO FIXED-POINT SCALES IN ONE PACKET, AND THIS IS WHERE THEY ARE
+// KEPT APART.  The four timestamps are 32.32 — whole seconds in the
+// high half, units of 2^-32 seconds in the low half.  Root delay and
+// root dispersion are 16.16, in units of 2^-16 seconds.  A codec that
+// used one scale for both is out by a factor of 65536, which on root
+// dispersion reads as "this server is eighteen hours wrong" or "this
+// server is perfect", depending on the direction, and neither looks
+// like a units bug.
+//
+// A `@value` STRUCT CANNOT BE A `Result` PAYLOAD, so a decode that can
+// fail does not answer one.  `is_wellformed` is the gate a caller runs
+// first, `decode` reads the bytes it was given, and `packet_fault` says
+// what is wrong with the packet that came out.  That is the shape the
+// language asks for and it is also the shape a device wants: the packet
+// lives in the caller's frame and nothing is allocated to parse it.
+
+// The wire size of an NTP packet without extensions or a MAC.
+pub const NTP_PACKET_BYTES = 48
+
+// The service port.
+pub const NTP_PORT = 123
+
+// The version this package writes.  Version 3 is accepted on the way
+// in, because a pool still contains servers that answer it.
+pub const NTP_VERSION = 4
+
+// Mode 3: a client asking.
+pub const NTP_MODE_CLIENT = 3
+
+// Mode 4: a server answering.  A reply in any other mode is refused —
+// see `NtpFaultNotAServerReply`.
+pub const NTP_MODE_SERVER = 4
+
+// Seconds between 1900-01-01 and 1970-01-01: the NTP epoch and the Unix
+// epoch, seventy years and seventeen leap days apart.
+pub const NTP_UNIX_EPOCH_DELTA = 2208988800
+
+// The highest stratum that means anything.  16 is "unsynchronised" and
+// anything above is reserved.
+pub const NTP_MAX_STRATUM = 15
+
+// One NTP timestamp: seconds and a fraction of a second.
+//
+// A `@value` struct, so it lives in the caller's frame with no header
+// and no allocation — a client that keeps four of these keeps
+// sixty-four bytes.
+pub @value
+struct NtpTimestamp
+    // Seconds since the NTP epoch, as the 32-bit field carries them.
+    // NOT a count that keeps growing: see `ntpcalc.unix_of` and the
+    // era rule, because this field wraps in 2036.
+    seconds: Int
+    // Units of 2^-32 seconds: one count is about 233 picoseconds, and
+    // the whole field is just under one second.
+    fraction: Int
+
+// One NTP packet, decoded.
+//
+// A `@value` struct: forty-eight bytes of wire become a value in the
+// caller's frame, which is what a device needs and what makes a whole
+// exchange a test with no allocator in it.
+pub @value
+struct NtpPacket
+    // 0 no warning, 1 last minute has 61 seconds, 2 it has 59, 3 the
+    // server's clock is NOT SYNCHRONISED.  Three is the one that
+    // matters: it is a refusal written in two bits.
+    leap: Int
+    version: Int
+    mode: Int
+    // 1 is a primary reference (a radio clock), 2..15 are secondary,
+    // and 0 is a KISS-O'-DEATH packet whose reference id is four
+    // characters of instruction.
+    stratum: Int
+    // The poll interval as a signed power of two seconds.
+    poll: Int
+    // The clock precision as a signed power of two seconds.  Typically
+    // negative and around -20 on a machine with a microsecond clock.
+    precision: Int
+    // Total round-trip delay to the primary reference, 16.16 fixed
+    // point in units of 2^-16 seconds.
+    root_delay: Int
+    // Maximum error relative to the primary reference, same scale.
+    // With `root_delay` this is what says how wrong the server may be,
+    // and a client that read neither accepts a stratum-15 server that
+    // is a minute out.
+    root_dispersion: Int
+    // Four bytes.  A four-character source name at stratum 1, an IPv4
+    // address or a hash at higher strata, and a KISS CODE at stratum 0.
+    // Kept as one big-endian integer because a `@value` struct cannot
+    // own a buffer; `reference_text` is the four characters.
+    reference_id: Int
+    // When the server's clock was last set.
+    reference_time: NtpTimestamp
+    // T1: when the client sent its request, AS THE CLIENT WROTE IT.
+    // The server copies it back, so this is the client's nonce — see
+    // `ntpcalc.check`.
+    originate: NtpTimestamp
+    // T2: when the request reached the server.
+    receive: NtpTimestamp
+    // T3: when the server sent this reply.
+    transmit: NtpTimestamp
+
+// A timestamp from its two halves.
+//
+// ```novo
+// use ntppkt
+//
+// fn t(s: Int, f: Int) -> NtpTimestamp
+//     ntppkt.timestamp(s, f)
+// ```
+pub @tier(embedded)
+fn timestamp(seconds: Int, fraction: Int) -> NtpTimestamp []
+    todo("ntp-nv.ntppkt.timestamp")
+
+// The zero timestamp, which means "no time at all".
+//
+// Not an absence to paper over: a reply whose transmit timestamp is
+// this is a server that answered without having a time to give, and
+// `ntpcalc.check` refuses it.
+pub @tier(embedded)
+fn zero_timestamp() -> NtpTimestamp []
+    todo("ntp-nv.ntppkt.zero_timestamp")
+
+// Whether two timestamps are the same sixty-four bits.
+//
+// The comparison the anti-spoofing check is: the reply's originate
+// field against the transmit field the client sent.  Both halves, and
+// nothing approximate about it.
+pub @tier(embedded)
+fn timestamp_eq(a: NtpTimestamp, b: NtpTimestamp) -> Bool []
+    todo("ntp-nv.ntppkt.timestamp_eq")
+
+// Whether a timestamp is the zero one.
+pub @tier(embedded)
+fn timestamp_is_zero(t: NtpTimestamp) -> Bool []
+    todo("ntp-nv.ntppkt.timestamp_is_zero")
+
+// A client request, carrying the caller's nonce as its transmit
+// timestamp.
+//
+// THE NONCE IS AN ARGUMENT AND THAT IS THE DESIGN.  RFC 4330 § 3 says
+// to put an unpredictable value in this field, because the server
+// copies it into the reply's originate field and comparing the two is
+// the only thing that stops an off-path attacker from answering first.
+// A `core`-shaped module has no randomness, so the caller supplies it —
+// and a caller that passes a counter, or the current time, has an SNTP
+// client with no anti-spoofing at all.  The README says so where
+// somebody about to do it will read it.
+pub @tier(embedded)
+fn request(nonce: NtpTimestamp) -> NtpPacket []
+    todo("ntp-nv.ntppkt.request")
+
+// Write a packet into a caller's buffer.
+//
+// Forty-eight bytes, big-endian throughout.  Answers how many bytes
+// were written, or zero when the buffer is too small — a device sizes
+// its buffer once and this is the check that it did.
+pub @tier(embedded)
+fn encode_into(out: [u8], at: Int, p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.encode_into")
+
+// Whether these bytes can be decoded at all.
+//
+// Length and version only.  Everything else a client must check is a
+// property of the reply rather than of the bytes, and `ntpcalc.check`
+// is where those live.
+pub @tier(embedded)
+fn is_wellformed(bytes: [u8], at: Int, len: Int) -> Bool []
+    todo("ntp-nv.ntppkt.is_wellformed")
+
+// Decode forty-eight bytes.
+//
+// Answers the packet it read, which for malformed input is a packet
+// whose fields are whatever the bytes said.  `is_wellformed` is the
+// gate, and the two are separate because a `@value` struct cannot be a
+// `Result` payload — the alternative would have been a boxed packet, and
+// a boxed packet is one a device cannot hold.
+pub @tier(embedded)
+fn decode(bytes: [u8], at: Int) -> NtpPacket []
+    todo("ntp-nv.ntppkt.decode")
+
+// The fault a packet's own fields imply, before any timing is
+// considered.
+//
+// Mode, version, leap indicator, stratum and the zero transmit
+// timestamp: the five checks that do not need the client's request.
+// `ntpcalc.check` adds the one that does.
+pub fn packet_fault(p: NtpPacket) -> ?NtpFault []
+    todo("ntp-nv.ntppkt.packet_fault")
+
+// The four characters of a stratum-0 reply's reference id.
+pub fn reference_text(p: NtpPacket) -> Str []
+    todo("ntp-nv.ntppkt.reference_text")
+
+// The kiss code a stratum-0 reply carries, when it is one.
+//
+// ```novo
+// use ntpfault
+// use ntppkt
+//
+// fn kiss(p: NtpPacket) -> ?NtpKiss
+//     ntppkt.kiss_of(p)
+// ```
+pub fn kiss_of(p: NtpPacket) -> ?NtpKiss []
+    todo("ntp-nv.ntppkt.kiss_of")
+
+// Whether a packet is a kiss-o'-death.
+pub @tier(embedded)
+fn is_kiss(p: NtpPacket) -> Bool []
+    todo("ntp-nv.ntppkt.is_kiss")
+
+// Root delay in microseconds.
+//
+// The 16.16 scale converted once, here, so that nothing else in this
+// package has to remember which of the two scales this field is in.
+pub @tier(embedded)
+fn root_delay_micros(p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.root_delay_micros")
+
+// Root dispersion in microseconds.
+pub @tier(embedded)
+fn root_dispersion_micros(p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.root_dispersion_micros")
+
+// The server's own worst-case error, in microseconds.
+//
+// `root_dispersion + root_delay / 2`, which is RFC 5905's own
+// expression for how far from the primary reference this server may be.
+// A client that read the stratum and stopped accepts a stratum-15
+// server that is a minute out, because the stratum says how many hops
+// and not how wrong.
+pub @tier(embedded)
+fn server_error_micros(p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.server_error_micros")
+
+// The poll interval in seconds, from the signed power of two.
+pub @tier(embedded)
+fn poll_seconds(p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.poll_seconds")
+
+// The clock precision in microseconds, from the signed power of two.
+pub @tier(embedded)
+fn precision_micros(p: NtpPacket) -> Int []
+    todo("ntp-nv.ntppkt.precision_micros")

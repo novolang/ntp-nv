@@ -1,0 +1,140 @@
+// ntppool.nv — which server to ask, and when to stop asking.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  A policy is a value; nothing here resolves a name
+// or opens a socket.
+//
+// THE POLICY IS A VALUE BECAUSE THE OBLIGATION IS THE CLIENT'S.  The
+// public NTP pool is run by volunteers and its abuse rules are not
+// advice: a client that polls faster than the server's own poll
+// interval, or that keeps asking after a `DENY`, gets an address range
+// blocked — and the program that does it is usually a program whose
+// author never saw the rule, because the library hid the poll loop.
+//
+// So the minimum interval is a named constant with the reason beside
+// it, `after_kiss` is what a kiss code does to the list, and there is
+// no function in this package that loops.  `ntpclient.query` asks ONE
+// server ONCE; the schedule is the caller's and it is visible in the
+// caller's code.
+//
+// AND THE DEFAULT LIST IS EMPTY.  A library that shipped
+// `pool.ntp.org` as a default sends every program that forgot to
+// configure one to a volunteer service, under this library's name.  The
+// README names the pool and its rules; the code makes the caller type
+// it.
+
+// The shortest interval a client may poll ONE server at, in seconds.
+//
+// RFC 4330 § 10's rule for a client with one server.  The pool's own
+// guidance is longer, and `POOL_MIN_POLL_SECONDS` is that.
+pub const NTP_MIN_POLL_SECONDS = 15
+
+// The shortest interval the public pool asks a client to use, in
+// seconds.
+pub const POOL_MIN_POLL_SECONDS = 64
+
+// How much to multiply the interval by on a `RATE` kiss.
+//
+// Doubling, and it does not come back down on its own: the server is
+// counting, and a client that halved the interval again after one
+// successful reply is a client that oscillates into the same refusal.
+pub const NTP_RATE_BACKOFF = 2
+
+// A list of servers and the rules for asking them.
+pub struct NtpPool
+    // Hostnames or addresses, in the order they will be tried.  EMPTY
+    // by default: see the module comment.
+    servers: [Str]
+    // The current poll interval in seconds, never below
+    // `NTP_MIN_POLL_SECONDS`.
+    poll_seconds: Int
+    // How long to wait for one reply, in milliseconds.
+    timeout_ms: Int
+    // How many servers to try before giving up on a round.
+    max_attempts: Int
+
+// A pool from a list of servers.
+//
+// ```novo
+// use ntppool
+//
+// fn p() -> NtpPool
+//     ntppool.pool(["time.example.org"], 64, 3000)
+// ```
+pub fn pool(servers: [Str], poll_seconds: Int, timeout_ms: Int) -> NtpPool []
+    todo("ntp-nv.ntppool.pool")
+
+// A pool with no servers at all.
+//
+// What a caller gets when it has not chosen, and what
+// `ntpclient.query_pool` refuses to work with — loudly, because the
+// alternative is a silent default pointing at somebody else's
+// volunteers.
+pub fn empty_pool() -> NtpPool []
+    todo("ntp-nv.ntppool.empty_pool")
+
+// The same pool with one more server at the end.
+pub fn with_server(p: NtpPool, server: Str) -> NtpPool []
+    todo("ntp-nv.ntppool.with_server")
+
+// The same pool without one server.
+//
+// What a `DENY` or `RSTR` kiss does: the server is gone for this
+// process, not skipped for one round.
+pub fn without(p: NtpPool, server: Str) -> NtpPool []
+    todo("ntp-nv.ntppool.without")
+
+// The pool a kiss code leaves behind.
+//
+// `DENY` and `RSTR` remove the server; `RATE` doubles the interval and
+// keeps the server.  One function, because these are the two
+// obligations a client has and splitting them is how one of them gets
+// forgotten.
+//
+// ```novo
+// use ntpfault
+// use ntppool
+//
+// fn obey(p: NtpPool, server: Str, k: NtpKiss) -> NtpPool
+//     ntppool.after_kiss(p, server, k)
+// ```
+pub fn after_kiss(p: NtpPool, server: Str, k: NtpKiss) -> NtpPool []
+    todo("ntp-nv.ntppool.after_kiss")
+
+// The same pool at a different poll interval, clamped at the floor.
+//
+// Clamped rather than refused, because a caller asking for five seconds
+// wants "as often as allowed" and a refusal there is a program that
+// does not start.
+pub fn with_poll(p: NtpPool, seconds: Int) -> NtpPool []
+    todo("ntp-nv.ntppool.with_poll")
+
+// The server to ask on attempt `n`, counting from zero.
+//
+// Round-robin over the list.  Published rather than looped internally
+// so a caller can see, in its own code, how many servers one round
+// costs a volunteer service.
+pub fn server_at(p: NtpPool, n: Int) -> ?Str []
+    todo("ntp-nv.ntppool.server_at")
+
+// How many servers the pool holds.
+pub fn server_count(p: NtpPool) -> Int []
+    todo("ntp-nv.ntppool.server_count")
+
+// Whether a pool can be used at all.
+//
+// False for an empty list, which is the default — see the module
+// comment.
+pub fn is_usable(p: NtpPool) -> Bool []
+    todo("ntp-nv.ntppool.is_usable")
+
+// The next poll interval after a reply, in seconds.
+//
+// The server's own advertised poll interval when it is longer than the
+// client's, and the client's otherwise.  A server that says "ask me
+// every 1024 seconds" has said something a client is expected to obey,
+// and a client that kept its own 64 is ignoring an instruction that is
+// in every reply.
+pub fn next_poll_seconds(p: NtpPool, server_poll_seconds: Int) -> Int []
+    todo("ntp-nv.ntppool.next_poll_seconds")

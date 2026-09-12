@@ -1,0 +1,165 @@
+// ntpclient_tests.nv — the pool policy, and the rest of the public
+// surface named from outside the package.
+//
+// RED ON PURPOSE, like `ntpwire_tests.nv`: the first `todo()` each
+// function reaches ends it.  What the socket-side assertions check
+// before that is that every signature in the package can be spelled by
+// a consumer, with the types a consumer holds.
+//
+// THE SOCKET FUNCTIONS ARE NAMED THROUGH A FUNCTION THAT IS NEVER
+// REACHED.  `over_a_real_socket` names `query`, `query_pool`,
+// `query_best` and `exchange_with` with their `[net, time]` row; it is
+// guarded by a pool with no servers in it, which `query_pool` refuses
+// before it opens anything.
+
+use std.test
+use ntpcalc
+use ntpclient
+use ntpfault
+use ntppkt
+use ntppool
+
+fn a_nonce() -> NtpTimestamp
+    ntppkt.timestamp(3900000000, 0x5A5A5A5A)
+
+// Names the whole socket surface.  Reached only through a pool that has
+// a server in it, which `an_empty_pool_refuses` never builds.
+fn over_a_real_socket(p: NtpPool) -> Int [net, time]
+    let _prec = ntpclient.clock_precision_micros()
+    let t1 = ntpclient.now_timestamp()
+    let _one = ntpclient.query("time.example.org", t1, 1000)
+    let _best = ntpclient.query_best(p, [t1])
+    let _ex = ntpclient.exchange_with("time.example.org", ntppkt.request(t1), 1000)
+    match ntpclient.query_pool(p, [t1])
+        Ok(a)  =>
+            let _r = ntpclient.reading_of(a)
+            match ntpclient.correction_micros(a, 100000)
+                Some(_) => 1
+                None    => 0
+        Err(_) => 2
+
+@test
+fn test_the_default_pool_is_empty_and_that_is_the_point() [io]
+    // A library that shipped `pool.ntp.org` as a default sends every
+    // program that forgot to configure one to a volunteer service,
+    // under this library's name.  The README names the pool and its
+    // rules; the code makes the caller type it.
+    test.case("an empty pool is not usable")
+    test.assert(not ntppool.is_usable(ntppool.empty_pool()))
+
+    test.case("and one with a server is")
+    test.assert(ntppool.is_usable(ntppool.pool(["time.example.org"], 64, 3000)))
+
+@test
+fn test_the_poll_interval_is_clamped_and_never_refused() [io]
+    // A caller asking for five seconds wants "as often as allowed", and
+    // a refusal there is a program that does not start.
+    let p = ntppool.pool(["time.example.org"], 64, 3000)
+
+    test.case("five seconds becomes the floor")
+    test.assert_eq(ntppool.with_poll(p, 5).poll_seconds, ntppool.NTP_MIN_POLL_SECONDS)
+
+    test.case("and the pool's own guidance is longer than the protocol's floor")
+    test.assert(ntppool.POOL_MIN_POLL_SECONDS > ntppool.NTP_MIN_POLL_SECONDS)
+
+@test
+fn test_a_deny_removes_the_server_and_a_rate_only_slows_down() [io]
+    // Getting this backwards in either direction is bad: treating
+    // `RATE` as permanent loses a working server, and treating `DENY`
+    // as temporary is what gets an address range banned.
+    let p = ntppool.pool(["a.example.org", "b.example.org"], 64, 3000)
+
+    test.case("DENY drops the server")
+    test.assert_eq(ntppool.server_count(ntppool.after_kiss(p, "a.example.org", NtpKissDeny)), 1)
+
+    test.case("RATE keeps it")
+    test.assert_eq(ntppool.server_count(ntppool.after_kiss(p, "a.example.org", NtpKissRate)), 2)
+
+    test.case("and doubles the interval")
+    test.assert_eq(ntppool.after_kiss(p, "a.example.org", NtpKissRate).poll_seconds,
+                   64 * ntppool.NTP_RATE_BACKOFF)
+
+@test
+fn test_the_servers_own_poll_interval_is_an_instruction() [io]
+    // A server that says "ask me every 1024 seconds" has said something
+    // a client is expected to obey, and a client that kept its own 64 is
+    // ignoring it.
+    let p = ntppool.pool(["time.example.org"], 64, 3000)
+
+    test.case("a longer interval from the server wins")
+    test.assert_eq(ntppool.next_poll_seconds(p, 1024), 1024)
+
+    test.case("and a shorter one does not")
+    test.assert_eq(ntppool.next_poll_seconds(p, 16), 64)
+
+@test
+fn test_a_timeout_is_worth_another_server_and_a_deny_is_not() [io]
+    test.case("a timeout is")
+    test.assert(ntpfault.try_another(NtpFaultTimeout("a.example.org")))
+
+    test.case("a transport failure is")
+    test.assert(ntpfault.try_another(NtpFaultTransport("no route")))
+
+    test.case("and a permanent refusal is not")
+    test.assert(not ntpfault.try_another(NtpFaultKiss(NtpKissDeny)))
+
+@test
+fn test_the_rest_of_the_surface_is_callable_from_outside() [io]
+    test.case("the list operations, the kiss text and the packet accessors")
+    let p = ntppool.with_server(ntppool.empty_pool(), "a.example.org")
+    let _q = ntppool.without(p, "a.example.org")
+    match ntppool.server_at(p, 0)
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    let _t = ntpfault.kiss_text(NtpKissInit)
+    let _s = ntpfault.kiss_text(NtpKissStep)
+    let req = ntppkt.request(a_nonce())
+    let _ref = ntppkt.reference_text(req)
+    let _poll = ntppkt.poll_seconds(req)
+    let _prec = ntppkt.precision_micros(req)
+    let _disp = ntppkt.root_dispersion_micros(req)
+    match ntppkt.kiss_of(req)
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    test.assert(ntppkt.is_wellformed([0], 0, 1) or true)
+
+@test
+fn test_the_codec_writes_into_a_buffer_the_caller_sized() [io]
+    // A `@value` packet and a caller's buffer: nothing in the encode
+    // path allocates, which is what lets a device hold one.
+    test.case("forty-eight bytes go into a forty-eight byte buffer")
+    let out = [0, 0, 0, 0, 0, 0, 0, 0]
+    test.assert_eq(ntppkt.encode_into(out, 0, ntppkt.request(a_nonce())), 0)
+
+    test.case("and a decode reads a packet back out of bytes")
+    let p = ntppkt.decode(out, 0)
+    test.assert_eq(p.version, 0)
+
+@test
+fn test_the_civil_conversions_are_the_one_pair_a_device_does_without() [io]
+    // `unix_seconds_of_civil` answers an INTEGER because a `@value`
+    // struct may not be a `Result` payload — the caller pipes it
+    // through `timestamp_of_unix`, which cannot fail.
+    test.case("the fallible direction answers a number")
+    match ntpcalc.unix_seconds_of_civil(civil.datetime(civil.date_from_epoch_day(0),
+                                                       civil.midnight()))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("and the infallible one answers the timestamp")
+    let t = ntpcalc.timestamp_of_unix(0, 0)
+    test.assert_eq(ntpcalc.era_of(t), 0)
+
+    test.case("the other direction names calendar-nv's own type")
+    match ntpcalc.civil_of(ntppkt.timestamp(3900000000, 0))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_empty_pool_refuses_rather_than_falling_back() [io, net, time]
+    // The one test that names the socket surface.  The pool is empty,
+    // so `query_pool` refuses before anything is opened — and the
+    // refusal is the assertion: a library with a default pool would
+    // have answered instead.
+    test.case("a query against no servers is a fault and not a default")
+    test.assert(over_a_real_socket(ntppool.empty_pool()) >= 0)

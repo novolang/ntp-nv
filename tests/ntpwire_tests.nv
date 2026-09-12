@@ -1,0 +1,262 @@
+// ntpwire_tests.nv — the packet, the two fixed-point scales, the era
+// rule and the checks RFC 4330 § 5 makes a client perform.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: ntp-nv.<module>.<fn>`.
+//
+// NOT ONE OF THESE TESTS OPENS A SOCKET OR READS A CLOCK.  The four
+// timestamps are arguments, the nonce is an argument, and the client's
+// own precision is an argument — so a whole exchange is a value a test
+// writes out, and the same bytes produce the same offset every run.
+
+use std.test
+use ntpcalc
+use ntpfault
+use ntppkt
+
+// A plausible server reply: stratum 2, version 4, mode 4, with the
+// client's nonce echoed into the originate field.
+fn a_reply(nonce: NtpTimestamp) -> NtpPacket
+    NtpPacket { leap: 0, version: 4, mode: 4, stratum: 2, poll: 6,
+                precision: 0 - 20, root_delay: 6554, root_dispersion: 6554,
+                reference_id: 0x47505300, reference_time: ntppkt.timestamp(3900000000, 0),
+                originate: nonce, receive: ntppkt.timestamp(3900000002, 0),
+                transmit: ntppkt.timestamp(3900000002, 0) }
+
+fn a_nonce() -> NtpTimestamp
+    ntppkt.timestamp(3900000000, 0x5A5A5A5A)
+
+@test
+fn test_the_reply_must_echo_the_nonce_the_client_sent() [io]
+    // The originate field is the only thing in SNTP an off-path
+    // attacker cannot know.  A client that skipped this check accepts
+    // the first forged reply to arrive — which, on an open network, is
+    // every reply, because the attacker does not have to wait for the
+    // real server.
+    let nonce = a_nonce()
+
+    test.case("the right nonce passes")
+    match ntpcalc.check(nonce, a_reply(nonce))
+        Some(_) => test.fail("a reply that echoes the nonce is usable")
+        None    => test.assert(true)
+
+    test.case("a different one is refused, and by name")
+    match ntpcalc.check(ntppkt.timestamp(3900000000, 1), a_reply(nonce))
+        Some(NtpFaultNonceMismatch) => test.assert(true)
+        Some(_)                     => test.fail("the fault names the nonce")
+        None                        => test.fail("a mismatched nonce is refused")
+
+@test
+fn test_a_server_that_is_not_synchronised_is_refused() [io]
+    // Leap indicator 3 means the server's own clock is not
+    // synchronised.  It is not an error at the server and it is a
+    // refusal here: a reply from a machine that does not know the time
+    // is worse than no reply, because it looks like an answer.
+    let nonce = a_nonce()
+    let r = a_reply(nonce)
+    let unsync = NtpPacket { leap: 3, version: r.version, mode: r.mode,
+                             stratum: r.stratum, poll: r.poll, precision: r.precision,
+                             root_delay: r.root_delay, root_dispersion: r.root_dispersion,
+                             reference_id: r.reference_id, reference_time: r.reference_time,
+                             originate: r.originate, receive: r.receive,
+                             transmit: r.transmit }
+
+    test.case("leap 3 is a refusal")
+    match ntppkt.packet_fault(unsync)
+        Some(NtpFaultUnsynchronised) => test.assert(true)
+        Some(_)                      => test.fail("the fault names the leap indicator")
+        None                         => test.fail("an unsynchronised server is refused")
+
+@test
+fn test_a_mode_three_reply_is_this_clients_own_request_coming_back() [io]
+    let nonce = a_nonce()
+    let r = a_reply(nonce)
+    let reflected = NtpPacket { leap: r.leap, version: r.version, mode: 3,
+                                stratum: r.stratum, poll: r.poll, precision: r.precision,
+                                root_delay: r.root_delay, root_dispersion: r.root_dispersion,
+                                reference_id: r.reference_id, reference_time: r.reference_time,
+                                originate: r.originate, receive: r.receive,
+                                transmit: r.transmit }
+
+    test.case("mode 3 is not a server reply")
+    match ntppkt.packet_fault(reflected)
+        Some(NtpFaultNotAServerReply(_)) => test.assert(true)
+        Some(_)                          => test.fail("the fault names the mode")
+        None                             => test.fail("only mode 4 is a reply")
+
+@test
+fn test_a_kiss_of_death_is_an_instruction_and_not_a_stratum() [io]
+    // Stratum 0 means the four bytes that would hold a reference
+    // identifier are four characters of instruction instead.  A client
+    // that read stratum 0 as "very good, a primary reference" and kept
+    // polling is the client that gets an address range banned.
+    test.case("DENY stops for good")
+    test.assert(ntpfault.kiss_stops_forever(NtpKissDeny))
+
+    test.case("RSTR stops for good")
+    test.assert(ntpfault.kiss_stops_forever(NtpKissRstr))
+
+    test.case("RATE does not — it means back off")
+    test.assert(not ntpfault.kiss_stops_forever(NtpKissRate))
+
+    test.case("and an unregistered code is still a refusal, carried whole")
+    match ntpfault.kiss_of_text("XNEW")
+        NtpKissOther(c) => test.assert_eq_str(c, "XNEW")
+        _               => test.fail("a new code is carried rather than guessed at")
+
+@test
+fn test_the_two_fixed_point_scales_are_not_the_same_scale() [io]
+    // The timestamps are 32.32, in units of 2^-32 seconds.  Root delay
+    // and root dispersion are 16.16, in units of 2^-16.  A codec that
+    // used one for both is out by 65536 — which on root dispersion
+    // reads as "this server is eighteen hours wrong" or "this server is
+    // perfect" and neither looks like a units bug.
+    test.case("half a second of timestamp fraction is five hundred thousand microseconds")
+    test.assert_eq(ntpcalc.fraction_micros(ntppkt.timestamp(0, 2147483648)), 500000)
+
+    test.case("and 6554 units of root delay is a tenth of a second")
+    test.assert_eq(ntppkt.root_delay_micros(a_reply(a_nonce())), 100006)
+
+@test
+fn test_the_era_rule_is_not_a_subtraction() [io]
+    // The seconds field is 32 bits and it wraps on 2036-02-07.  RFC
+    // 4330 § 3's rule is that the high-order bit decides the era.  A
+    // client that subtracted 2208988800 unconditionally starts
+    // answering dates in 1900 that morning, from packets that are
+    // perfectly valid, and no test written before then fails.
+    test.case("a timestamp with the high bit set is era 0")
+    test.assert_eq(ntpcalc.era_of(ntppkt.timestamp(3900000000, 0)), 0)
+
+    test.case("one with it clear is era 1 — after February 2036")
+    test.assert_eq(ntpcalc.era_of(ntppkt.timestamp(1000000, 0)), 1)
+
+    test.case("and the Unix conversion follows it")
+    test.assert(ntpcalc.unix_seconds_of(ntppkt.timestamp(1000000, 0))
+                > ntpcalc.NTP_ERA1_UNIX_START)
+
+@test
+fn test_the_offset_is_the_average_and_the_delay_is_the_difference() [io]
+    // `((T2 - T1) + (T3 - T4)) / 2` and `(T4 - T1) - (T3 - T2)`.  The
+    // exchange below is a server two seconds ahead with a one-second
+    // round trip, which is a case a reader can check by hand.
+    let e = ntpcalc.exchange(ntppkt.timestamp(3900000000, 0),
+                             ntppkt.timestamp(3900000002, 0),
+                             ntppkt.timestamp(3900000002, 0),
+                             ntppkt.timestamp(3900000001, 0))
+
+    test.case("the client is two and a half seconds behind")
+    test.assert_eq(ntpcalc.offset_micros(e), 2500000)
+
+    test.case("and the round trip was one second")
+    test.assert_eq(ntpcalc.delay_micros(e, 1), 1000000)
+
+@test
+fn test_a_negative_delay_is_clamped_rather_than_refused() [io]
+    // With a clock coarser than the network is fast — which is every
+    // microcontroller — the delay comes out below zero.  RFC 5905 § 8
+    // says to clamp it to the system precision.  A client that treated
+    // it as a failure gets no time at all on exactly the hardware that
+    // needs it most.
+    let e = ntpcalc.exchange(ntppkt.timestamp(3900000000, 0),
+                             ntppkt.timestamp(3900000000, 0),
+                             ntppkt.timestamp(3900000002, 0),
+                             ntppkt.timestamp(3900000001, 0))
+
+    test.case("the computed delay is negative here")
+    test.assert(ntpcalc.delay_was_clamped(e, 1000))
+
+    test.case("so the answer is the precision, not a fault")
+    test.assert_eq(ntpcalc.delay_micros(e, 1000), 1000)
+
+@test
+fn test_the_stratum_says_how_many_hops_and_not_how_wrong() [io]
+    // Root dispersion plus half the root delay is what says how wrong a
+    // server may be.  A client that read the stratum and stopped
+    // accepts a stratum-15 server that is a minute out.
+    let r = a_reply(a_nonce())
+
+    test.case("the server's own error comes from the two root fields")
+    test.assert(ntppkt.server_error_micros(r) > 0)
+
+    test.case("and a reading's worst case includes half the round trip")
+    let e = ntpcalc.exchange(ntppkt.timestamp(3900000000, 0),
+                             ntppkt.timestamp(3900000002, 0),
+                             ntppkt.timestamp(3900000002, 0),
+                             ntppkt.timestamp(3900000001, 0))
+    let reading = ntpcalc.reading(e, r, 1)
+    test.assert(ntpcalc.worst_error_micros(reading) >= ntppkt.server_error_micros(r))
+
+@test
+fn test_the_better_of_two_readings_is_the_faster_one_and_not_the_newer() [io]
+    // The offset's accuracy is bounded by half the round trip, so a
+    // client holding three replies keeps the one with the smallest
+    // delay.  A client that kept the most recent is keeping the wrong
+    // one.
+    let quick = NtpReading { offset_micros: 5000, delay_micros: 1000,
+                             server_error_micros: 100, stratum: 3, clamped: false }
+    let slow = NtpReading { offset_micros: 5000, delay_micros: 90000,
+                            server_error_micros: 100, stratum: 1, clamped: false }
+
+    test.case("a smaller delay wins, even at a deeper stratum")
+    test.assert(ntpcalc.better(quick, slow))
+
+    test.case("and not the other way round")
+    test.assert(not ntpcalc.better(slow, quick))
+
+@test
+fn test_a_request_carries_the_nonce_and_nothing_else_identifying() [io]
+    let nonce = a_nonce()
+    let r = ntppkt.request(nonce)
+
+    test.case("the request is mode 3, version 4")
+    test.assert_eq(r.mode, ntppkt.NTP_MODE_CLIENT)
+    test.assert_eq(r.version, ntppkt.NTP_VERSION)
+
+    test.case("and the nonce is in the transmit field, which the server echoes")
+    test.assert(ntppkt.timestamp_eq(r.transmit, nonce))
+
+@test
+fn test_a_zero_transmit_timestamp_is_a_server_with_no_time_to_give() [io]
+    let nonce = a_nonce()
+    let r = a_reply(nonce)
+    let empty = NtpPacket { leap: r.leap, version: r.version, mode: r.mode,
+                            stratum: r.stratum, poll: r.poll, precision: r.precision,
+                            root_delay: r.root_delay, root_dispersion: r.root_dispersion,
+                            reference_id: r.reference_id, reference_time: r.reference_time,
+                            originate: r.originate, receive: r.receive,
+                            transmit: ntppkt.zero_timestamp() }
+
+    test.case("a zero transmit timestamp is refused by name")
+    match ntppkt.packet_fault(empty)
+        Some(NtpFaultZeroTransmit) => test.assert(true)
+        Some(_)                    => test.fail("the fault names the transmit field")
+        None                       => test.fail("a server with no time is refused")
+
+    test.case("and the zero timestamp is what the field holds")
+    test.assert(ntppkt.timestamp_is_zero(empty.transmit))
+
+@test
+fn test_a_stratum_zero_reply_is_recognised_before_its_stratum_is_read() [io]
+    // `is_kiss` is the check a device makes, because it is the one
+    // refusal a firmware has to obey and the one that costs somebody
+    // else something when it does not.
+    let nonce = a_nonce()
+    let r = a_reply(nonce)
+    let kod = NtpPacket { leap: r.leap, version: r.version, mode: r.mode,
+                          stratum: 0, poll: r.poll, precision: r.precision,
+                          root_delay: r.root_delay, root_dispersion: r.root_dispersion,
+                          reference_id: 0x44454E59, reference_time: r.reference_time,
+                          originate: r.originate, receive: r.receive,
+                          transmit: r.transmit }
+
+    test.case("stratum 0 is a kiss and not a very good server")
+    test.assert(ntppkt.is_kiss(kod))
+
+    test.case("an ordinary reply is not one")
+    test.assert(not ntppkt.is_kiss(r))
+
+    test.case("and the four bytes read as the code they are")
+    match ntppkt.kiss_of(kod)
+        Some(NtpKissDeny) => test.assert(true)
+        Some(_)           => test.fail("0x44454E59 is DENY")
+        None              => test.fail("a stratum-0 reply carries a kiss code")

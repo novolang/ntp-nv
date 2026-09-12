@@ -1,0 +1,232 @@
+// ntpcalc.nv — the four timestamps, and what a client is allowed to
+// conclude from them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT, AND `@tier(embedded)` ON EVERYTHING BUT THE CIVIL
+// CONVERSION.  This is integer arithmetic over four sixty-four bit
+// values; a sensor can run it and this package's device probe does.
+//
+// AN SNTP EXCHANGE ANSWERS AN OFFSET, NOT A TIME.  That is the whole
+// design of this module and the reason `NtpReading` has no "the time
+// is" field.  A client learns two numbers — how far its own clock is
+// from the server's, and how long the round trip took — and what to do
+// about the first is a policy it cannot delegate: a program that steps
+// its clock backwards breaks every monotonic assumption above it, one
+// that slews takes hours to converge, and one on a device with no clock
+// at all just wants the number to add.  A library that answered "the
+// time is X" made that choice for all three.
+//
+// THE DELAY CAN BE NEGATIVE AND THAT IS NOT AN ERROR.  With a clock
+// whose precision is coarser than the network is fast — which is every
+// microcontroller — `(T4 - T1) - (T3 - T2)` comes out below zero.  RFC
+// 5905 § 8's rule is to clamp it to the system precision rather than to
+// discard the reading, so `delay_micros` clamps and `NtpReading.clamped`
+// records that it did.  A client that treated a negative delay as a
+// failure gets no time at all on exactly the hardware that needs it
+// most.
+
+use ntppkt
+
+// The instant the 32-bit seconds field wraps: 2036-02-07T06:28:16Z, as
+// seconds since the Unix epoch.
+//
+// Published because the rollover is a date a reader wants to be able to
+// find, and because the era rule below is otherwise a magic comparison.
+pub const NTP_ERA1_UNIX_START = 2085978496
+
+// The four timestamps of one exchange.
+//
+// A `@value` struct, because its four fields are: a boxed struct stores
+// pointer-shaped slots and cannot hold an unboxed one, so an exchange
+// that holds four `NtpTimestamp`s is a `@value` or it is four pairs of
+// loose integers.  Which is the right answer anyway — thirty-two bytes
+// in the caller's frame is what a device holds while it waits for a
+// reply.
+pub @value
+struct NtpExchange
+    // T1, as the client wrote it into the request — and therefore the
+    // nonce the reply's originate field must match.
+    sent: NtpTimestamp
+    // T2 and T3, out of the reply.
+    server_receive: NtpTimestamp
+    server_transmit: NtpTimestamp
+    // T4, the client's clock when the reply arrived.
+    received: NtpTimestamp
+
+// What one exchange is worth.
+//
+// A `@value` struct: five numbers and a flag, in the caller's frame.
+pub @value
+struct NtpReading
+    // How far the client's clock is BEHIND the server's, in
+    // microseconds.  Positive means the client is slow.  This is the
+    // number, and the client decides what to do with it.
+    offset_micros: Int
+    // The round trip, in microseconds.  The offset cannot be more
+    // accurate than half of this, which is why a client that has three
+    // replies keeps the one with the smallest delay rather than the
+    // most recent.
+    delay_micros: Int
+    // The server's own worst-case error, from its root delay and root
+    // dispersion.  Added to half the delay this is how wrong the
+    // reading may be, and `worst_error_micros` is that sum.
+    server_error_micros: Int
+    // The stratum the reading came from, so a caller holding several
+    // can prefer the shallower one.
+    stratum: Int
+    // True when the computed delay was below zero and was clamped to
+    // the clock's precision.  See the module comment: it is a property
+    // of the client's clock rather than a fault.
+    clamped: Bool
+
+// An exchange from its four timestamps.
+//
+// ```novo
+// use ntpcalc
+// use ntppkt
+//
+// fn ex(t1: NtpTimestamp, t4: NtpTimestamp, r: NtpPacket) -> NtpExchange
+//     ntpcalc.exchange(t1, r.receive, r.transmit, t4)
+// ```
+pub fn exchange(sent: NtpTimestamp, server_receive: NtpTimestamp, server_transmit: NtpTimestamp,
+                received: NtpTimestamp) -> NtpExchange []
+    todo("ntp-nv.ntpcalc.exchange")
+
+// Every reason this reply may not be used, or nothing.
+//
+// The five checks `ntppkt.packet_fault` makes, plus THE ONE THAT NEEDS
+// THE REQUEST: the reply's originate timestamp must be the exact
+// sixty-four bits the client sent.  That is the only unforgeable thing
+// in SNTP, and separating the two functions is what makes it visible
+// that a client calling only the first has skipped it.
+//
+// ```novo
+// use ntpcalc
+// use ntpfault
+// use ntppkt
+//
+// fn usable(sent: NtpTimestamp, reply: NtpPacket) -> Bool
+//     match ntpcalc.check(sent, reply)
+//         Some(_) => false
+//         None    => true
+// ```
+pub fn check(sent: NtpTimestamp, reply: NtpPacket) -> ?NtpFault []
+    todo("ntp-nv.ntpcalc.check")
+
+// The offset, in microseconds.
+//
+// `((T2 - T1) + (T3 - T4)) / 2`.  Positive means the client's clock is
+// behind the server's, which is the sign convention every other NTP
+// implementation uses and the one a caller adding it to their clock
+// expects.
+pub @tier(embedded)
+fn offset_micros(e: NtpExchange) -> Int []
+    todo("ntp-nv.ntpcalc.offset_micros")
+
+// The round-trip delay, in microseconds, clamped at `precision`.
+//
+// `(T4 - T1) - (T3 - T2)`, and see the module comment for why it is
+// clamped rather than refused when it comes out negative.  `precision`
+// is the client's own clock precision in microseconds, which
+// `ntppkt.precision_micros` reads off a reply for the server's side and
+// a caller supplies for its own.
+pub @tier(embedded)
+fn delay_micros(e: NtpExchange, precision_micros: Int) -> Int []
+    todo("ntp-nv.ntpcalc.delay_micros")
+
+// Whether the delay came out negative and was clamped.
+pub @tier(embedded)
+fn delay_was_clamped(e: NtpExchange, precision_micros: Int) -> Bool []
+    todo("ntp-nv.ntpcalc.delay_was_clamped")
+
+// A reading from an exchange and the reply it came from.
+//
+// The one call a client makes after `check` says nothing is wrong.
+pub fn reading(e: NtpExchange, reply: NtpPacket, precision_micros: Int) -> NtpReading []
+    todo("ntp-nv.ntpcalc.reading")
+
+// How wrong a reading may be, in microseconds.
+//
+// Half the round trip plus the server's own error.  A caller that
+// wanted a bound rather than a number uses this, and a caller
+// synchronising a log wants it in the log.
+pub @tier(embedded)
+fn worst_error_micros(r: NtpReading) -> Int []
+    todo("ntp-nv.ntpcalc.worst_error_micros")
+
+// Which of two readings is better.
+//
+// Smaller delay wins, then shallower stratum, then smaller server
+// error.  Delay first because the offset's accuracy is bounded by it,
+// which is why a client that keeps the most RECENT of several replies
+// is keeping the wrong one.
+pub @tier(embedded)
+fn better(a: NtpReading, b: NtpReading) -> Bool []
+    todo("ntp-nv.ntpcalc.better")
+
+// Seconds since the Unix epoch, for an NTP timestamp.
+//
+// THE 2036 RULE IS HERE AND IT IS NOT A SUBTRACTION.  The seconds field
+// is 32 bits and it wraps on 2036-02-07.  RFC 4330 § 3's rule is that
+// the high-order bit decides the era: set means 1968–2036 and the
+// 1900 epoch, clear means 2036–2104 and the next one.  A client that
+// subtracted 2208988800 unconditionally starts answering dates in 1900
+// on that morning, from a packet that is perfectly valid, and no test
+// written before then fails.
+//
+// ```novo
+// use ntpcalc
+// use ntppkt
+//
+// fn unix(t: NtpTimestamp) -> Int
+//     ntpcalc.unix_seconds_of(t)
+// ```
+pub @tier(embedded)
+fn unix_seconds_of(t: NtpTimestamp) -> Int []
+    todo("ntp-nv.ntpcalc.unix_seconds_of")
+
+// An NTP timestamp for a Unix second and microsecond.
+//
+//
+// The same era rule in reverse, so a round trip through both is the
+// identity on both sides of 2036.
+pub @tier(embedded)
+fn timestamp_of_unix(seconds: Int, micros: Int) -> NtpTimestamp []
+    todo("ntp-nv.ntpcalc.timestamp_of_unix")
+
+// Which era an NTP timestamp is in: 0 for 1900–2036, 1 for 2036–2104.
+//
+// Published rather than kept inside `unix_seconds_of` because a caller
+// logging raw timestamps needs to be able to say which era it read
+// them in, and because the rule is the one thing in this package a
+// reader is most likely to want to check.
+pub @tier(embedded)
+fn era_of(t: NtpTimestamp) -> Int []
+    todo("ntp-nv.ntpcalc.era_of")
+
+// The fraction of a second as microseconds.
+//
+// The 2^-32 scale converted once, here.
+pub @tier(embedded)
+fn fraction_micros(t: NtpTimestamp) -> Int []
+    todo("ntp-nv.ntpcalc.fraction_micros")
+
+// A timestamp as a civil date and time, UTC.
+//
+// The ONE function in this package that names calendar-nv's types, and
+// the one the device claim does not cover — a microcontroller adding an
+// offset to its own counter needs the integer and not the calendar.
+pub fn civil_of(t: NtpTimestamp) -> Result<CivilDateTime, CalError> []
+    todo("ntp-nv.ntpcalc.civil_of")
+
+// Seconds since the Unix epoch for a civil date and time, UTC.
+//
+// The other direction, and it answers an INTEGER rather than a
+// timestamp: a `@value` struct may not be a `Result` payload, so the
+// conversion that can fail hands back the number and the caller pipes
+// it through `timestamp_of_unix`, which cannot.  That is the language's
+// rule shaping the signature, and it is written here rather than worked
+// around.
+pub fn unix_seconds_of_civil(dt: CivilDateTime) -> Result<Int, CalError> []
+    todo("ntp-nv.ntpcalc.unix_seconds_of_civil")

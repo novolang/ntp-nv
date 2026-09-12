@@ -1,0 +1,162 @@
+// ntpclient.nv — the half that touches the machine: one datagram out,
+// one datagram in, and two clock reads around them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW.  Four
+// modules under `src/` are `[]` throughout.
+//
+// TWO LABELS, AND EACH ONE IS ONE THING.  `[net]` is the UDP socket's.
+// `[time]` is `now_timestamp`'s, and `now_timestamp` is called exactly
+// twice per exchange — once to stamp T1 and once to stamp T4 — because
+// the offset is the difference between those two readings and the
+// server's two, and a client that read its clock once has thrown away
+// the round trip it was trying to measure.
+//
+// `[rand]` IS NOT IN THIS ROW, AND THAT IS A DECISION.  The transmit
+// timestamp a request carries is the client's only nonce: the server
+// copies it back and `ntpcalc.check` compares the two, which is the
+// one thing an off-path attacker cannot forge.  RFC 4330 § 3 says to
+// make it unpredictable.  This package takes it as an ARGUMENT rather
+// than drawing it, so that the package's row stays `[net, time]` and
+// so that a caller can drive a whole exchange against a recorded reply
+// and get the same answer every run.  The cost is that a caller who
+// passes a counter has an SNTP client with no anti-spoofing — which is
+// why it is a named parameter called `nonce`, why the README says it
+// twice, and why `query` will not accept the timestamp it just read
+// from the clock as one.
+//
+// AND THE STANDARD LIBRARY'S UDP CANNOT CARRY THIS PROTOCOL TODAY.
+// `net.udp_recv_from` answers a NUL-terminated string, so a datagram is
+// truncated at its first zero byte — and an NTP packet's second byte is
+// the stratum, which is 0 in every kiss-o'-death reply, while the
+// fourth is a signed precision and the root delay is usually zeroes.
+// The README's "What is missing" section names the stdlib row this
+// needs; the signatures here are written against the API that row would
+// provide, because writing them against the one that exists would be
+// designing around a defect.
+
+use ntpcalc
+use ntppkt
+use ntppool
+
+// One completed exchange with one server.
+//
+// FLAT, AND THAT IS THE LANGUAGE SHAPING THE TYPE.  `NtpReading` and
+// `NtpPacket` are both `@value` structs and a boxed struct stores
+// pointer-shaped slots, so this cannot hold either of them beside a
+// `Str`.  The alternative was to make this a `@value` too and lose the
+// server's name, which is the one field a caller needs to act on a kiss
+// code.  So the numbers are flattened and `reading_of` rebuilds the
+// `@value` for a caller that wants `ntpcalc.better`.
+pub struct NtpAnswer
+    // Which server answered.
+    server: Str
+    // How far the client's clock is behind the server's, in
+    // microseconds.
+    offset_micros: Int
+    // The round trip, in microseconds.
+    delay_micros: Int
+    // The server's own worst-case error, in microseconds.
+    server_error_micros: Int
+    // The stratum that answered.
+    stratum: Int
+    // Whether a negative delay was clamped to the clock's precision.
+    clamped: Bool
+    // The leap indicator the reply carried.  0, 1 and 2 are ordinary;
+    // 3 never reaches here, because `ntpcalc.check` refuses it.
+    leap: Int
+    // The reply's reference id, as the four big-endian bytes.
+    reference_id: Int
+    // The poll interval the server advertised, in seconds.  A server
+    // that says "ask me every 1024 seconds" has given an instruction,
+    // and `ntppool.next_poll_seconds` is what obeys it.
+    server_poll_seconds: Int
+
+// Ask one server once.
+//
+// `[net, time]`: the datagram, and the two clock reads that stamp T1
+// and T4.
+//
+// THE NONCE IS THE CALLER'S and it must be unpredictable — see the
+// module comment.  A caller with no randomness at all is better served
+// by `ntppkt.request` and its own transport than by passing something
+// guessable here.
+//
+// ONE SERVER, ONCE.  There is no retry and no loop: the poll schedule
+// is the caller's, it is `ntppool`'s constants that say how slow it has
+// to be, and a library that hid the loop is how a program ends up
+// banned from a volunteer service without its author ever seeing the
+// rule.
+pub fn query(server: Str, nonce: NtpTimestamp,
+             timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
+    todo("ntp-nv.ntpclient.query")
+
+// Ask the servers in a pool until one answers, at most
+// `p.max_attempts` times.
+//
+// Refuses an empty pool with `NtpFaultNoServerAnswered(0)` rather than
+// falling back to a default, for the reason `ntppool`'s module comment
+// gives.  The nonces are a list so that each attempt gets its own: a
+// client that reused one across three servers has a value the second
+// and third replies could both have been recorded from.
+pub fn query_pool(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
+    todo("ntp-nv.ntpclient.query_pool")
+
+// The best of several readings, from one round against several
+// servers.
+//
+// `[net, time]` for the same two reasons, and the answer is
+// `ntpcalc.better`'s: smallest delay first.  A caller that wants the
+// individual answers drives `query` itself.
+pub fn query_best(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
+    todo("ntp-nv.ntpclient.query_best")
+
+// The client's clock as an NTP timestamp.
+//
+// `[time]`, and the ONE function in this package that reads a clock.
+// Called twice per exchange by `query`, and published because a caller
+// driving its own transport has to stamp T1 and T4 the same way.
+pub fn now_timestamp() -> NtpTimestamp [time]
+    todo("ntp-nv.ntpclient.now_timestamp")
+
+// The client's own clock precision, in microseconds.
+//
+// `[time]`, because the honest way to answer it is to read the clock
+// twice and see what changed.  It is what `ntpcalc.delay_micros` clamps
+// a negative delay to, and on a device it is the difference between a
+// reading and a refusal.
+pub fn clock_precision_micros() -> Int [time]
+    todo("ntp-nv.ntpclient.clock_precision_micros")
+
+// Send a request and wait for one reply, with the packet and the two
+// stamps left to the caller.
+//
+// `[net, time]`.  The exchange a caller builds when it wants to choose
+// its own nonce, its own socket lifetime and its own timeout, and the
+// function `query` is written in terms of.  Answers the reply and T4
+// together, because the instant the datagram arrived is part of the
+// measurement and re-reading the clock afterwards adds the time spent
+// parsing to the round trip.
+pub fn exchange_with(server: Str, request: NtpPacket,
+                     timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
+    todo("ntp-nv.ntpclient.exchange_with")
+
+// The reading inside an answer, as the `@value` the arithmetic takes.
+//
+// The rebuild the flattening above costs, in one function, so that a
+// caller comparing two answers still calls `ntpcalc.better` rather than
+// writing the comparison again.
+pub fn reading_of(a: NtpAnswer) -> NtpReading []
+    todo("ntp-nv.ntpclient.reading_of")
+
+// What the answer says the caller's clock should be corrected by, in
+// microseconds, or nothing when the reading is not worth acting on.
+//
+// `max_error_micros` is the caller's tolerance: a reading whose
+// worst-case error exceeds it answers `None`, because an offset of two
+// milliseconds that might be wrong by four hundred is not a correction.
+// `[]`, because it is `ntpcalc` arithmetic — published here so that a
+// caller has the whole decision in one place.
+pub fn correction_micros(a: NtpAnswer, max_error_micros: Int) -> ?Int []
+    todo("ntp-nv.ntpclient.correction_micros")

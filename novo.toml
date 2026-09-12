@@ -1,0 +1,52 @@
+[package]
+name        = "ntp-nv"
+version     = "0.0.1"
+description = "An SNTP client (RFC 4330) over the NTPv4 packet (RFC 5905 § 7.3): the forty-eight bytes as a @value, the two fixed-point scales the packet mixes, offset and round-trip arithmetic, the 2036 era rule, the kiss-o'-death codes a pool server answers, and a pool policy that is a value.  The codec and the arithmetic build for a microcontroller.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and FOUR OF THE FIVE MODULES DECLARE NOTHING.  `ntpfault`,
+# `ntppkt`, `ntpcalc` and `ntppool` are `[]` throughout: forty-eight
+# bytes in, forty-eight bytes out, and integer arithmetic over them.
+# What performs is `ntpclient` — `[net]` for the datagram and `[time]`
+# for the two clock reads an exchange needs, and NOTHING ELSE.  The
+# nonce that makes a reply unforgeable is an ARGUMENT, which is what
+# keeps `[rand]` out of this row; the README's "Where a row wanted to
+# widen" section is about exactly that.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`,
+# because the plan's row is `host` and the subject is a client that
+# asks a server for the time.  The README argues the `ntp-core-nv`
+# row the four `[]` modules would move to, and what it would buy.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["ntp", "sntp", "rfc4330", "rfc5905", "clock", "time-sync", "embedded"]
+repository  = "https://github.com/novolang/ntp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "What the time is, as an offset rather than an answer"
+
+[dependencies]
+# Civil dates, for the one conversion a caller actually wants: an NTP
+# timestamp is seconds since 1900 and a program wants a date.  It is a
+# dependency rather than four lines here because the 2036 era rule and
+# the leap-year arithmetic are two different kinds of wrong to get
+# right, and calendar-nv already owns the second.
+#
+# NOT used by the modules the device claim covers: `ntppkt` and
+# `ntpcalc` answer integers, and `ntpcivil` is the one function that
+# names a `CivilDateTime`.
+calendar-nv = "^0.0.2"
