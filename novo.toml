@@ -1,6 +1,6 @@
 [package]
 name        = "ntp-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "An SNTP client (RFC 4330) over the NTPv4 packet (RFC 5905 § 7.3): the forty-eight bytes as a @value, the two fixed-point scales the packet mixes, offset and round-trip arithmetic, the 2036 era rule, the kiss-o'-death codes a pool server answers, and a pool policy that is a value.  The codec and the arithmetic build for a microcontroller.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -49,4 +49,4 @@ novo        = ">= 0.8.9"
 # NOT used by the modules the device claim covers: `ntppkt` and
 # `ntpcalc` answer integers, and `ntpcivil` is the one function that
 # names a `CivilDateTime`.
-calendar-nv = "^0.0.2"
+calendar-nv = "^0.2.0"
