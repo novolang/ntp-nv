@@ -1,8 +1,6 @@
 // ntppkt.nv — the forty-eight bytes, and the two fixed-point scales
 // they mix.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT, AND `@tier(embedded)` ON THE ARITHMETIC.  A sensor
 // with a radio and no battery-backed clock is the consumer that makes
 // this claim real: it holds forty-eight bytes and does integer
@@ -18,12 +16,17 @@
 // server is perfect", depending on the direction, and neither looks
 // like a units bug.
 //
-// A `@value` STRUCT CANNOT BE A `Result` PAYLOAD, so a decode that can
-// fail does not answer one.  `is_wellformed` is the gate a caller runs
-// first, `decode` reads the bytes it was given, and `packet_fault` says
-// what is wrong with the packet that came out.  That is the shape the
-// language asks for and it is also the shape a device wants: the packet
-// lives in the caller's frame and nothing is allocated to parse it.
+// A DECODE THAT CAN FAIL ANSWERS THE PACKET, NOT A `Result` OF ONE.
+// A `@value` struct crosses a `Result` payload by boxing a copy of
+// itself — an allocation — and at `@tier(embedded)` a payload-carrying
+// `Result` is refused outright.  So `is_wellformed` is the gate a
+// caller runs first, `decode` reads the bytes it was given, and
+// `packet_fault` says what is wrong with the packet that came out.
+// That is the shape a device wants: the packet lives in the caller's
+// frame and nothing is allocated to parse it.
+
+use std.str
+use ntpfault
 
 // The wire size of an NTP packet without extensions or a MAC.
 pub const NTP_PACKET_BYTES = 48
@@ -58,7 +61,7 @@ pub const NTP_MAX_STRATUM = 15
 pub @value
 struct NtpTimestamp
     // Seconds since the NTP epoch, as the 32-bit field carries them.
-    // NOT a count that keeps growing: see `ntpcalc.unix_of` and the
+    // NOT a count that keeps growing: see `ntpcalc.unix_seconds_of` and
     // era rule, because this field wraps in 2036.
     seconds: Int
     // Units of 2^-32 seconds: one count is about 233 picoseconds, and
@@ -111,6 +114,99 @@ struct NtpPacket
     // T3: when the server sent this reply.
     transmit: NtpTimestamp
 
+// THE BYTE READER AND WRITER, AND WHY IT IS IN THIS SHAPE.  Every read
+// past the end of the buffer answers zero rather than refusing, which
+// is what makes `decode` total: a caller that skipped `is_wellformed`
+// gets a packet whose fields are the bytes that were there and zeroes
+// for the rest, and `packet_fault` refuses it.  Nothing in this block
+// allocates, which is what keeps the codec at `@tier(embedded)`.
+@tier(embedded)
+fn get_u8(bytes: [u8], at: Int) -> Int
+    if at < 0 or at >= list.len(bytes)
+        0
+    else
+        bytes[at] as Int
+
+@tier(embedded)
+fn get_u32(bytes: [u8], at: Int) -> Int
+    (get_u8(bytes, at) << 24) | (get_u8(bytes, at + 1) << 16) | (get_u8(bytes, at + 2) << 8) | get_u8(bytes, at + 3)
+
+@tier(embedded)
+fn get_timestamp(bytes: [u8], at: Int) -> NtpTimestamp
+    NtpTimestamp { seconds: get_u32(bytes, at), fraction: get_u32(bytes, at + 4) }
+
+// The write half.  `var out: [u8]` rather than `out: [u8]` because the
+// write has to reach the caller's buffer and a list parameter that is
+// not `var` is a copy the callee writes into and drops — see the
+// CHANGELOG's `### Known` entry.
+@tier(embedded)
+fn put_u32(var out: [u8], at: Int, v: Int)
+    out[at] = (v >> 24) & 255
+    out[at + 1] = (v >> 16) & 255
+    out[at + 2] = (v >> 8) & 255
+    out[at + 3] = v & 255
+
+// A byte the packet's own field says is signed, as the two signed
+// fields in the header are.
+@tier(embedded)
+fn signed_byte(v: Int) -> Int
+    if v >= 128
+        v - 256
+    else
+        v
+
+// The same for the two 32-bit fixed-point fields.  RFC 5905 § 7.3
+// writes them signed and a client that read them unsigned answers a
+// dispersion of four billion seconds for a byte pattern that means
+// minus one.
+@tier(embedded)
+fn signed32(v: Int) -> Int
+    if v >= 2147483648
+        v - 4294967296
+    else
+        v
+
+// Two to the power of a signed exponent field, clamped where the
+// packet's scale runs out: `poll` and `precision` are signed powers of
+// two seconds, and a server is free to send one no hardware can honour.
+@tier(embedded)
+fn pow2(exp: Int) -> Int
+    if exp < 0
+        0
+    elif exp > 30
+        1073741824
+    else
+        1 << exp
+
+// Byte `i` of a reference id, high byte first.
+@tier(embedded)
+fn ref_byte(id: Int, i: Int) -> Int
+    (id >> (24 - i * 8)) & 255
+
+@tier(embedded)
+fn printable(v: Int) -> Bool
+    v >= 32 and v <= 126
+
+// Whether a reference id is the four printable characters that make it
+// a code.  Stratum 0 with a zero reference id is a request, or a server
+// answering "unspecified", and neither is a kiss-o'-death: the code
+// field is four ASCII characters or it is not a code.
+@tier(embedded)
+fn ref_is_text(id: Int) -> Bool
+    printable(ref_byte(id, 0)) and printable(ref_byte(id, 1)) and printable(ref_byte(id, 2)) and printable(ref_byte(id, 3))
+
+// The four characters of a reference id, at the tier that can build a
+// `Str`.  A function of its own rather than a join written at the call
+// site, because a `+` join written inside a match arm leaks a cell
+// whether or not the arm is taken.
+@tier(rt)
+fn four_chars(id: Int) -> Str
+    str.from_byte(ref_byte(id, 0)) + str.from_byte(ref_byte(id, 1)) + str.from_byte(ref_byte(id, 2)) + str.from_byte(ref_byte(id, 3))
+
+@tier(rt)
+fn kiss_from_id(id: Int) -> NtpKiss
+    ntpfault.kiss_of_text(four_chars(id))
+
 // A timestamp from its two halves.
 //
 // ```novo
@@ -121,7 +217,7 @@ struct NtpPacket
 // ```
 pub @tier(embedded)
 fn timestamp(seconds: Int, fraction: Int) -> NtpTimestamp []
-    todo("ntp-nv.ntppkt.timestamp")
+    NtpTimestamp { seconds: seconds, fraction: fraction }
 
 // The zero timestamp, which means "no time at all".
 //
@@ -130,7 +226,7 @@ fn timestamp(seconds: Int, fraction: Int) -> NtpTimestamp []
 // `ntpcalc.check` refuses it.
 pub @tier(embedded)
 fn zero_timestamp() -> NtpTimestamp []
-    todo("ntp-nv.ntppkt.zero_timestamp")
+    NtpTimestamp { seconds: 0, fraction: 0 }
 
 // Whether two timestamps are the same sixty-four bits.
 //
@@ -139,12 +235,12 @@ fn zero_timestamp() -> NtpTimestamp []
 // nothing approximate about it.
 pub @tier(embedded)
 fn timestamp_eq(a: NtpTimestamp, b: NtpTimestamp) -> Bool []
-    todo("ntp-nv.ntppkt.timestamp_eq")
+    a.seconds == b.seconds and a.fraction == b.fraction
 
 // Whether a timestamp is the zero one.
 pub @tier(embedded)
 fn timestamp_is_zero(t: NtpTimestamp) -> Bool []
-    todo("ntp-nv.ntppkt.timestamp_is_zero")
+    t.seconds == 0 and t.fraction == 0
 
 // A client request, carrying the caller's nonce as its transmit
 // timestamp.
@@ -159,7 +255,20 @@ fn timestamp_is_zero(t: NtpTimestamp) -> Bool []
 // somebody about to do it will read it.
 pub @tier(embedded)
 fn request(nonce: NtpTimestamp) -> NtpPacket []
-    todo("ntp-nv.ntppkt.request")
+    NtpPacket {
+        leap: 0,
+        version: NTP_VERSION,
+        mode: NTP_MODE_CLIENT,
+        stratum: 0,
+        poll: 0,
+        precision: 0,
+        root_delay: 0,
+        root_dispersion: 0,
+        reference_id: 0,
+        reference_time: zero_timestamp(),
+        originate: zero_timestamp(),
+        receive: zero_timestamp(),
+        transmit: nonce }
 
 // Write a packet into a caller's buffer.
 //
@@ -167,8 +276,26 @@ fn request(nonce: NtpTimestamp) -> NtpPacket []
 // were written, or zero when the buffer is too small — a device sizes
 // its buffer once and this is the check that it did.
 pub @tier(embedded)
-fn encode_into(out: [u8], at: Int, p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.encode_into")
+fn encode_into(var out: [u8], at: Int, p: NtpPacket) -> Int []
+    if at < 0 or list.len(out) < at + NTP_PACKET_BYTES
+        0
+    else
+        out[at] = ((p.leap & 3) << 6) | ((p.version & 7) << 3) | (p.mode & 7)
+        out[at + 1] = p.stratum & 255
+        out[at + 2] = p.poll & 255
+        out[at + 3] = p.precision & 255
+        put_u32(out, at + 4, p.root_delay)
+        put_u32(out, at + 8, p.root_dispersion)
+        put_u32(out, at + 12, p.reference_id)
+        put_u32(out, at + 16, p.reference_time.seconds)
+        put_u32(out, at + 20, p.reference_time.fraction)
+        put_u32(out, at + 24, p.originate.seconds)
+        put_u32(out, at + 28, p.originate.fraction)
+        put_u32(out, at + 32, p.receive.seconds)
+        put_u32(out, at + 36, p.receive.fraction)
+        put_u32(out, at + 40, p.transmit.seconds)
+        put_u32(out, at + 44, p.transmit.fraction)
+        NTP_PACKET_BYTES
 
 // Whether these bytes can be decoded at all.
 //
@@ -177,18 +304,39 @@ fn encode_into(out: [u8], at: Int, p: NtpPacket) -> Int []
 // is where those live.
 pub @tier(embedded)
 fn is_wellformed(bytes: [u8], at: Int, len: Int) -> Bool []
-    todo("ntp-nv.ntppkt.is_wellformed")
+    if at < 0 or len < NTP_PACKET_BYTES
+        false
+    elif at + NTP_PACKET_BYTES > list.len(bytes)
+        false
+    else
+        let version = (get_u8(bytes, at) >> 3) & 7
+        version == 3 or version == 4
 
 // Decode forty-eight bytes.
 //
 // Answers the packet it read, which for malformed input is a packet
 // whose fields are whatever the bytes said.  `is_wellformed` is the
-// gate, and the two are separate because a `@value` struct cannot be a
-// `Result` payload — the alternative would have been a boxed packet, and
-// a boxed packet is one a device cannot hold.
+// gate, and the two are separate because a `Result` carrying this
+// `@value` struct would box a copy of it — an allocation, and one the
+// embedded tier refuses — and a boxed packet is one a device cannot
+// hold.
 pub @tier(embedded)
 fn decode(bytes: [u8], at: Int) -> NtpPacket []
-    todo("ntp-nv.ntppkt.decode")
+    let b0 = get_u8(bytes, at)
+    NtpPacket {
+        leap: (b0 >> 6) & 3,
+        version: (b0 >> 3) & 7,
+        mode: b0 & 7,
+        stratum: get_u8(bytes, at + 1),
+        poll: signed_byte(get_u8(bytes, at + 2)),
+        precision: signed_byte(get_u8(bytes, at + 3)),
+        root_delay: signed32(get_u32(bytes, at + 4)),
+        root_dispersion: signed32(get_u32(bytes, at + 8)),
+        reference_id: get_u32(bytes, at + 12),
+        reference_time: get_timestamp(bytes, at + 16),
+        originate: get_timestamp(bytes, at + 24),
+        receive: get_timestamp(bytes, at + 32),
+        transmit: get_timestamp(bytes, at + 40) }
 
 // The fault a packet's own fields imply, before any timing is
 // considered.
@@ -196,12 +344,27 @@ fn decode(bytes: [u8], at: Int) -> NtpPacket []
 // Mode, version, leap indicator, stratum and the zero transmit
 // timestamp: the five checks that do not need the client's request.
 // `ntpcalc.check` adds the one that does.
-pub fn packet_fault(p: NtpPacket) -> ?NtpFault []
-    todo("ntp-nv.ntppkt.packet_fault")
+pub @tier(rt)
+fn packet_fault(p: NtpPacket) -> ?NtpFault []
+    if p.mode != NTP_MODE_SERVER
+        Some(NtpFaultNotAServerReply(p.mode))
+    elif p.version < 3 or p.version > 4
+        Some(NtpFaultBadVersion(p.version))
+    elif p.leap == 3
+        Some(NtpFaultUnsynchronised)
+    elif p.stratum == 0
+        Some(NtpFaultKiss(kiss_from_id(p.reference_id)))
+    elif p.stratum > NTP_MAX_STRATUM
+        Some(NtpFaultBadStratum(p.stratum))
+    elif timestamp_is_zero(p.transmit)
+        Some(NtpFaultZeroTransmit)
+    else
+        None
 
 // The four characters of a stratum-0 reply's reference id.
-pub fn reference_text(p: NtpPacket) -> Str []
-    todo("ntp-nv.ntppkt.reference_text")
+pub @tier(rt)
+fn reference_text(p: NtpPacket) -> Str []
+    four_chars(p.reference_id)
 
 // The kiss code a stratum-0 reply carries, when it is one.
 //
@@ -212,13 +375,17 @@ pub fn reference_text(p: NtpPacket) -> Str []
 // fn kiss(p: NtpPacket) -> ?NtpKiss
 //     ntppkt.kiss_of(p)
 // ```
-pub fn kiss_of(p: NtpPacket) -> ?NtpKiss []
-    todo("ntp-nv.ntppkt.kiss_of")
+pub @tier(rt)
+fn kiss_of(p: NtpPacket) -> ?NtpKiss []
+    if is_kiss(p)
+        Some(kiss_from_id(p.reference_id))
+    else
+        None
 
 // Whether a packet is a kiss-o'-death.
 pub @tier(embedded)
 fn is_kiss(p: NtpPacket) -> Bool []
-    todo("ntp-nv.ntppkt.is_kiss")
+    p.stratum == 0 and ref_is_text(p.reference_id)
 
 // Root delay in microseconds.
 //
@@ -226,12 +393,12 @@ fn is_kiss(p: NtpPacket) -> Bool []
 // package has to remember which of the two scales this field is in.
 pub @tier(embedded)
 fn root_delay_micros(p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.root_delay_micros")
+    p.root_delay * 1000000 / 65536
 
 // Root dispersion in microseconds.
 pub @tier(embedded)
 fn root_dispersion_micros(p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.root_dispersion_micros")
+    p.root_dispersion * 1000000 / 65536
 
 // The server's own worst-case error, in microseconds.
 //
@@ -242,14 +409,19 @@ fn root_dispersion_micros(p: NtpPacket) -> Int []
 // and not how wrong.
 pub @tier(embedded)
 fn server_error_micros(p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.server_error_micros")
+    root_dispersion_micros(p) + root_delay_micros(p) / 2
 
 // The poll interval in seconds, from the signed power of two.
 pub @tier(embedded)
 fn poll_seconds(p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.poll_seconds")
+    pow2(p.poll)
 
 // The clock precision in microseconds, from the signed power of two.
 pub @tier(embedded)
 fn precision_micros(p: NtpPacket) -> Int []
-    todo("ntp-nv.ntppkt.precision_micros")
+    if p.precision >= 0
+        pow2(p.precision) * 1000000
+    elif p.precision < -30
+        1
+    else
+        (1000000 + (1 << (0 - p.precision)) - 1) / (1 << (0 - p.precision))

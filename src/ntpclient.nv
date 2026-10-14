@@ -1,8 +1,6 @@
 // ntpclient.nv — the half that touches the machine: one datagram out,
 // one datagram in, and two clock reads around them.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS IS THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW.  Four
 // modules under `src/` are `[]` throughout.
 //
@@ -26,17 +24,32 @@
 // twice, and why `query` will not accept the timestamp it just read
 // from the clock as one.
 //
-// AND THE STANDARD LIBRARY'S UDP CANNOT CARRY THIS PROTOCOL TODAY.
-// `net.udp_recv_from` answers a NUL-terminated string, so a datagram is
-// truncated at its first zero byte — and an NTP packet's second byte is
-// the stratum, which is 0 in every kiss-o'-death reply, while the
-// fourth is a signed precision and the root delay is usually zeroes.
-// The README's "What is missing" section names the stdlib row this
-// needs; the signatures here are written against the API that row would
-// provide, because writing them against the one that exists would be
-// designing around a defect.
+// THE UDP THE STANDARD LIBRARY HAS CARRIES THIS PROTOCOL, AND THROUGH
+// `Str` RATHER THAN `Bytes`.  `net.udp_send_to` sends the payload it is
+// given by that payload's own length, and `net.udp_recv_from` answers
+// the bytes the kernel counted rather than a string's terminator — so a
+// packet that is mostly zeroes crosses intact as long as it crosses as
+// a `Str`: `bytes.to_str(bytes.from_byte_list(frame))` out, and
+// `bytes.to_byte_list(bytes.from_str(data))` in.  Nothing in this
+// package hands a `Bytes` to `udp_send_to`'s `data: Any`, because a
+// `Bytes` there sends the buffer's length word instead of its bytes —
+// that is a defect in the standard library rather than a decision here,
+// it is filed, and the CHANGELOG's `### Known` entry names it.
+//
+// AND NOTHING OFFLINE REACHES A REPLY.  Port 123 is below the
+// unprivileged floor, so no suite in this repository can put a server
+// where this client will talk to it: the arm that consumes an arriving
+// datagram, and the two functions that read a reply's fields, are this
+// package's `cov: skip` regions.  Everything they call is covered —
+// the decoder, the five checks, the offset, the reading — and each
+// marker names the measurement it rests on.
 
+use std.bytes
+use std.math
+use std.net
+use std.time
 use ntpcalc
+use ntpfault
 use ntppkt
 use ntppool
 
@@ -73,6 +86,142 @@ pub struct NtpAnswer
     // and `ntppool.next_poll_seconds` is what obeys it.
     server_poll_seconds: Int
 
+// THE FAULT MESSAGES THAT ARE BUILT RATHER THAN QUOTED, one function
+// each.  A `+` join written inside a match arm leaks a cell whether or
+// not the arm is taken, which is why the joins live here and not at the
+// three sites that need them.
+@tier(app)
+fn unresolved(server: Str) -> NtpFault
+    NtpFaultTransport("no address for " + server)
+
+@tier(app)
+fn unsendable(server: Str) -> NtpFault
+    NtpFaultTransport("could not send to " + server)
+
+// The nonce for attempt `i`.
+//
+// Wrapped rather than padded, and an empty list is the zero timestamp: a
+// caller that passes fewer nonces than attempts weakens its own
+// anti-spoofing, and a caller that passes none sends a value the
+// protocol never carries — both visible on the wire rather than
+// silently repaired here.  One nonce per attempt is what the README
+// says, and it is what every pool-shaped caller does.
+@tier(app)
+fn nonce_at(nonces: [NtpTimestamp], i: Int) -> NtpTimestamp
+    if list.is_empty(nonces)
+        ntppkt.zero_timestamp()
+    else
+        list.get(nonces, i % list.len(nonces))
+
+// How many servers one round may ask.
+//
+// `ntppool` floors this when a pool is built, and a pool built field by
+// field is still a pool: a round that asks nobody is not a round.
+@tier(app)
+fn attempts_of(p: NtpPool) -> Int
+    math.max(p.max_attempts, 1)
+
+// Which of two answers is the better one, with the first still in hand.
+//
+// The comparison itself is `ntpcalc.better`'s and it goes through
+// `reading_of`, because the alternative — comparing the flattened
+// fields here — is the comparison written a second time in a second
+// place.
+@tier(app)
+// cov: skip — only an `Ok` from `exchange_with` reaches it, and that needs a server on port 123.
+fn better_of(best: ?NtpAnswer, a: NtpAnswer) -> ?NtpAnswer
+    match best
+        Some(b) =>
+            if ntpcalc.better(reading_of(a), reading_of(b))
+                Some(a)
+            else
+                Some(b)
+        None    =>
+            Some(a)
+
+// The reply's bytes, turned into an answer.
+//
+// The gate first, then the packet, then the six checks — of which the
+// nonce is the one that needs the request — and only then the
+// arithmetic.  A reply that fails any of them is a fault and there is no
+// answer at all: an `NtpAnswer` a caller can hold is an answer this
+// function was able to justify.
+@tier(app)
+// cov: skip — only an arriving datagram reaches it, and port 123 is below the unprivileged floor.
+fn answer_from(server: Str, request: NtpPacket, raw: [u8], t4: NtpTimestamp,
+               precision_micros: Int) -> Result<NtpAnswer, NtpFault>
+    if not ntppkt.is_wellformed(raw, 0, list.len(raw))
+        return Err(NtpFaultShortPacket(list.len(raw)))
+    let reply = ntppkt.decode(raw, 0)
+    match ntpcalc.check(request.transmit, reply)
+        Some(f) =>
+            Err(f)
+        None    =>
+            let e = ntpcalc.exchange(request.transmit, reply.receive, reply.transmit, t4)
+            let r = ntpcalc.reading(e, reply, precision_micros)
+            Ok(NtpAnswer {
+                server: server,
+                offset_micros: r.offset_micros,
+                delay_micros: r.delay_micros,
+                server_error_micros: r.server_error_micros,
+                stratum: r.stratum,
+                clamped: r.clamped,
+                leap: reply.leap,
+                reference_id: reply.reference_id,
+                server_poll_seconds: ntppkt.poll_seconds(reply) })
+
+// One round of `query_pool`: servers in order, at most one datagram
+// each, stopping at the first answer.
+//
+// A ROUND AND NOT A SCHEDULE.  The recursion here is bounded by
+// `attempts`, every server gets one request and no server is ever asked
+// twice, and there is nothing in this function that waits — the poll
+// interval is the caller's and `ntppool`'s constants are what it has to
+// respect.  The fault of a failed attempt is dropped: what the round
+// answers is `NtpFaultNoServerAnswered`, and the fault that names WHY —
+// a kiss, a timeout, a socket — is what `query` answers, because `query`
+// is called with one server and the caller already knows which.
+@tier(app)
+fn ask_in_order(p: NtpPool, nonces: [NtpTimestamp], i: Int,
+                attempts: Int) -> Result<NtpAnswer, NtpFault> [net, time]
+    if i >= attempts
+        return Err(NtpFaultNoServerAnswered(i))
+    // cov: skip — `is_usable` was checked before this round, so `server_at` cannot answer None at an `i` it reaches.
+    let Some(server) = ntppool.server_at(p, i) else
+        return Err(NtpFaultNoServerAnswered(i))
+    match exchange_with(server, ntppkt.request(nonce_at(nonces, i)), p.timeout_ms)
+        // cov: skip — an `Ok` here is an answer, and an answer needs a server on port 123.
+        Ok(a)  => Ok(a)
+        Err(_) => ask_in_order(p, nonces, i + 1, attempts)
+
+// One round of `query_best`: every server in the list, keeping the
+// best answer of the ones that came back.
+//
+// Asking all of them is the point — the best of one is that one — and
+// the count is still `max_attempts`, so a pool of two servers is two
+// datagrams and not a loop over time.
+@tier(app)
+fn best_in_order(p: NtpPool, nonces: [NtpTimestamp], i: Int, attempts: Int,
+                 best: ?NtpAnswer) -> Result<NtpAnswer, NtpFault> [net, time]
+    if i >= attempts
+        return finish_round(best, i)
+    // cov: skip — the same `is_usable` check covers this round's `server_at` calls.
+    let Some(server) = ntppool.server_at(p, i) else
+        return finish_round(best, i)
+    let kept = match exchange_with(server, ntppkt.request(nonce_at(nonces, i)), p.timeout_ms)
+        // cov: skip — the same: `better_of` is reached only by a reply that arrived.
+        Ok(a)  => better_of(best, a)
+        Err(_) => best
+    best_in_order(p, nonces, i + 1, attempts, kept)
+
+// The answer a finished round has, or the fault that it has none.
+@tier(app)
+fn finish_round(best: ?NtpAnswer, tried: Int) -> Result<NtpAnswer, NtpFault>
+    match best
+        // cov: skip — `Some` is an answer, and every path that can hold one needs a server on port 123.
+        Some(a) => Ok(a)
+        None    => Err(NtpFaultNoServerAnswered(tried))
+
 // Ask one server once.
 //
 // `[net, time]`: the datagram, and the two clock reads that stamp T1
@@ -88,9 +237,10 @@ pub struct NtpAnswer
 // to be, and a library that hid the loop is how a program ends up
 // banned from a volunteer service without its author ever seeing the
 // rule.
-pub fn query(server: Str, nonce: NtpTimestamp,
-             timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
-    todo("ntp-nv.ntpclient.query")
+pub @tier(app)
+fn query(server: Str, nonce: NtpTimestamp,
+         timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
+    exchange_with(server, ntppkt.request(nonce), timeout_ms)
 
 // Ask the servers in a pool until one answers, at most
 // `p.max_attempts` times.
@@ -99,9 +249,13 @@ pub fn query(server: Str, nonce: NtpTimestamp,
 // falling back to a default, for the reason `ntppool`'s module comment
 // gives.  The nonces are a list so that each attempt gets its own: a
 // client that reused one across three servers has a value the second
-// and third replies could both have been recorded from.
-pub fn query_pool(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
-    todo("ntp-nv.ntpclient.query_pool")
+// and third replies could both have been recorded from.  A list shorter
+// than the attempt count is reused from the start — see `nonce_at`.
+pub @tier(app)
+fn query_pool(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
+    if not ntppool.is_usable(p)
+        return Err(NtpFaultNoServerAnswered(0))
+    ask_in_order(p, nonces, 0, attempts_of(p))
 
 // The best of several readings, from one round against several
 // servers.
@@ -109,16 +263,28 @@ pub fn query_pool(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFa
 // `[net, time]` for the same two reasons, and the answer is
 // `ntpcalc.better`'s: smallest delay first.  A caller that wants the
 // individual answers drives `query` itself.
-pub fn query_best(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
-    todo("ntp-nv.ntpclient.query_best")
+pub @tier(app)
+fn query_best(p: NtpPool, nonces: [NtpTimestamp]) -> Result<NtpAnswer, NtpFault> [net, time]
+    if not ntppool.is_usable(p)
+        return Err(NtpFaultNoServerAnswered(0))
+    best_in_order(p, nonces, 0, attempts_of(p), None)
 
 // The client's clock as an NTP timestamp.
 //
 // `[time]`, and the ONE function in this package that reads a clock.
 // Called twice per exchange by `query`, and published because a caller
 // driving its own transport has to stamp T1 and T4 the same way.
-pub fn now_timestamp() -> NtpTimestamp [time]
-    todo("ntp-nv.ntpclient.now_timestamp")
+//
+// Floored rather than truncated, so the fraction is a fraction on both
+// sides of 1970: `time.unix_ts` goes toward zero, which for a clock set
+// before the epoch would leave a negative fraction in a field that has
+// no room for one.
+pub @tier(app)
+fn now_timestamp() -> NtpTimestamp [time]
+    let now = time.now()
+    let whole = math.floor(now)
+    let micros = ((now - whole) * 1000000.0) as Int
+    ntpcalc.timestamp_of_unix(whole as Int, micros)
 
 // The client's own clock precision, in microseconds.
 //
@@ -126,8 +292,15 @@ pub fn now_timestamp() -> NtpTimestamp [time]
 // twice and see what changed.  It is what `ntpcalc.delay_micros` clamps
 // a negative delay to, and on a device it is the difference between a
 // reading and a refusal.
-pub fn clock_precision_micros() -> Int [time]
-    todo("ntp-nv.ntpclient.clock_precision_micros")
+//
+// Never zero: a resolution below a microsecond is still a microsecond
+// as far as this package's arithmetic is concerned, and a clamp at zero
+// would report every clamped delay as no delay at all.
+pub @tier(app)
+fn clock_precision_micros() -> Int [time]
+    let a = time.now()
+    let b = time.now()
+    math.max(((b - a) * 1000000.0) as Int, 1)
 
 // Send a request and wait for one reply, with the packet and the two
 // stamps left to the caller.
@@ -138,17 +311,54 @@ pub fn clock_precision_micros() -> Int [time]
 // together, because the instant the datagram arrived is part of the
 // measurement and re-reading the clock afterwards adds the time spent
 // parsing to the round trip.
-pub fn exchange_with(server: Str, request: NtpPacket,
-                     timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
-    todo("ntp-nv.ntpclient.exchange_with")
+//
+// The clock is read for T4 BEFORE the bytes are parsed, for the same
+// reason, and the socket is closed before the parse as well: the reply
+// is a value by then and a socket left open on the path that refuses a
+// reply is a descriptor the caller never sees again.
+pub @tier(app)
+fn exchange_with(server: Str, request: NtpPacket,
+                 timeout_ms: Int) -> Result<NtpAnswer, NtpFault> [net, time]
+    let Some(ip) = net.dns_lookup(server) else
+        return Err(unresolved(server))
+    let Some(sock) = net.udp_socket() else
+        // cov: skip — an unopenable datagram socket needs an exhausted descriptor table
+        return Err(NtpFaultTransport("no datagram socket"))
+    // The deadline is a socket option and its failure is answered by the
+    // first read rather than here, which is also why the read is the
+    // only place a timeout is reported from.
+    let _ = net.set_recv_timeout(sock, timeout_ms)
+    var frame: [u8] = bytes.to_byte_list(bytes.zeros(ntppkt.NTP_PACKET_BYTES))
+    let _ = ntppkt.encode_into(frame, 0, request)
+    let precision_micros = clock_precision_micros()
+    // `Str` and not `Bytes`: see the module comment and the CHANGELOG's
+    // `### Known` entry.
+    let wire = bytes.to_str(bytes.from_byte_list(frame))
+    if not net.udp_send_to(sock, ip, ntppkt.NTP_PORT, wire)
+        net.close(sock)
+        return Err(unsendable(server))
+    let reply = net.udp_recv_from(sock, ntppkt.NTP_PACKET_BYTES)
+    let t4 = now_timestamp()
+    net.close(sock)
+    match reply
+        None               =>
+            Err(NtpFaultTimeout(server))
+        // cov: skip — an arriving datagram needs a server on port 123, which is below the floor.
+        Some((data, _who)) => answer_from(server, request, bytes.to_byte_list(bytes.from_str(data)), t4, precision_micros)
 
 // The reading inside an answer, as the `@value` the arithmetic takes.
 //
 // The rebuild the flattening above costs, in one function, so that a
 // caller comparing two answers still calls `ntpcalc.better` rather than
 // writing the comparison again.
-pub fn reading_of(a: NtpAnswer) -> NtpReading []
-    todo("ntp-nv.ntpclient.reading_of")
+pub @tier(app)
+fn reading_of(a: NtpAnswer) -> NtpReading []
+    NtpReading {
+        offset_micros: a.offset_micros,
+        delay_micros: a.delay_micros,
+        server_error_micros: a.server_error_micros,
+        stratum: a.stratum,
+        clamped: a.clamped }
 
 // What the answer says the caller's clock should be corrected by, in
 // microseconds, or nothing when the reading is not worth acting on.
@@ -158,5 +368,10 @@ pub fn reading_of(a: NtpAnswer) -> NtpReading []
 // milliseconds that might be wrong by four hundred is not a correction.
 // `[]`, because it is `ntpcalc` arithmetic — published here so that a
 // caller has the whole decision in one place.
-pub fn correction_micros(a: NtpAnswer, max_error_micros: Int) -> ?Int []
-    todo("ntp-nv.ntpclient.correction_micros")
+pub @tier(app)
+fn correction_micros(a: NtpAnswer, max_error_micros: Int) -> ?Int []
+    let r = reading_of(a)
+    if ntpcalc.worst_error_micros(r) > max_error_micros
+        None
+    else
+        Some(r.offset_micros)

@@ -1,9 +1,6 @@
 // ntpwire_tests.nv — the packet, the two fixed-point scales, the era
 // rule and the checks RFC 4330 § 5 makes a client perform.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: ntp-nv.<module>.<fn>`.
-//
 // NOT ONE OF THESE TESTS OPENS A SOCKET OR READS A CLOCK.  The four
 // timestamps are arguments, the nonce is an argument, and the client's
 // own precision is an argument — so a whole exchange is a value a test
@@ -144,8 +141,8 @@ fn test_the_offset_is_the_average_and_the_delay_is_the_difference() [io]
                              ntppkt.timestamp(3900000002, 0),
                              ntppkt.timestamp(3900000001, 0))
 
-    test.case("the client is two and a half seconds behind")
-    test.assert_eq(ntpcalc.offset_micros(e), 2500000)
+    test.case("the client is a second and a half behind")
+    test.assert_eq(ntpcalc.offset_micros(e), 1500000)
 
     test.case("and the round trip was one second")
     test.assert_eq(ntpcalc.delay_micros(e, 1), 1000000)

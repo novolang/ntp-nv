@@ -1,0 +1,591 @@
+// ntp_edge_tests.nv — the boundaries and the refusals the two shipped
+// suites leave.
+//
+// The suites that came with the interface release walk the middle of
+// every function: a request that round-trips, a reply that checks out,
+// a pool that refuses an empty list.  This file is the other half —
+// the exponent past the packet's scale, the byte the packet calls
+// signed, the kiss code that is not one of the five registered, the
+// timestamp before 1970, a buffer one byte too small — and the three
+// transport failures a client meets when there is no server to talk
+// to: a name that does not resolve, a port nothing answers on, and an
+// address the kernel refuses to send to.
+//
+// IT OPENS SOCKETS AND READS CLOCKS, which is why it is not part of
+// `ntpwire_tests.nv`: everything in that file is a value the test
+// writes out.  The cases that open a socket are the ones the `cov:
+// skip` markers in `ntpclient.nv` rest on — port 123 is below the
+// unprivileged floor, so a suite here can reach every failure a client
+// has and none of its answers.
+
+use std.bytes
+use std.test
+use ntpcalc
+use ntpclient
+use ntpfault
+use ntppkt
+use ntppool
+
+// "DENY" and "GPS\0", as the four big-endian bytes a reference id is.
+const DENY_ID: Int = 0x44454E59
+const GPS_ID: Int = 0x47505300
+
+fn put32(var out: [u8], at: Int, v: Int)
+    out[at] = (v >> 24) & 255
+    out[at + 1] = (v >> 16) & 255
+    out[at + 2] = (v >> 8) & 255
+    out[at + 3] = v & 255
+
+// Forty-eight bytes of a well-formed server reply that echoes `nonce`.
+//
+// Written by hand rather than built with `ntppkt.encode_into`, because
+// what the cases below need to vary — a stratum, a signed byte, a
+// reference id — is exactly what the encoder would compute for them.
+fn a_reply(nonce: NtpTimestamp) -> [u8]
+    var f: [u8] = bytes.to_byte_list(bytes.zeros(48))
+    f[0] = (4 << 3) | 4
+    f[1] = 2
+    f[2] = 6
+    f[3] = 236
+    put32(f, 12, GPS_ID)
+    put32(f, 24, nonce.seconds)
+    put32(f, 28, nonce.fraction)
+    put32(f, 32, 3900000120)
+    put32(f, 36, 0)
+    put32(f, 40, 3900000123)
+    put32(f, 44, 0x80000000)
+    f
+
+fn a_nonce() -> NtpTimestamp
+    ntppkt.timestamp(3900000000, 0x5A5A5A5A)
+
+fn a_reply_packet() -> NtpPacket
+    ntppkt.decode(a_reply(a_nonce()), 0)
+
+@test
+fn test_a_request_round_trips_through_forty_eight_bytes() [io]
+    let req = ntppkt.request(a_nonce())
+
+    test.case("the encoder fills the caller's buffer and says how much it wrote")
+    var frame: [u8] = bytes.to_byte_list(bytes.zeros(ntppkt.NTP_PACKET_BYTES))
+    test.assert_eq(ntppkt.encode_into(frame, 0, req), ntppkt.NTP_PACKET_BYTES)
+
+    test.case("the version and mode are the two the request is made of")
+    test.assert_eq(frame[0], (4 << 3) | 3)
+
+    test.case("and the bytes decode back to the packet that was written")
+    test.assert(ntppkt.is_wellformed(frame, 0, ntppkt.NTP_PACKET_BYTES))
+    let back = ntppkt.decode(frame, 0)
+    test.assert_eq(back.version, 4)
+    test.assert_eq(back.mode, ntppkt.NTP_MODE_CLIENT)
+    test.assert(ntppkt.timestamp_eq(back.transmit, a_nonce()))
+    test.assert(ntppkt.timestamp_is_zero(back.originate))
+    test.assert(not ntppkt.timestamp_is_zero(back.transmit))
+
+    test.case("a request is not a reply, and the fault names the mode")
+    match ntppkt.packet_fault(req)
+        Some(f) => test.assert(f.message() == "mode 3 is not a server reply")
+        None    => test.assert(false)
+
+    test.case("the four fixed-point readers answer the fields it carries")
+    test.assert_eq(ntppkt.poll_seconds(req), 1)
+    test.assert_eq(ntppkt.precision_micros(req), 1000000)
+    test.assert_eq(ntppkt.root_delay_micros(req), 0)
+    test.assert_eq(ntppkt.root_dispersion_micros(req), 0)
+    test.assert_eq(ntppkt.server_error_micros(req), 0)
+
+    test.case("and a reference id of zero is not a kiss code")
+    match ntppkt.kiss_of(req)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_byte_the_packet_calls_signed_crosses_as_one() [io]
+    var f = a_reply(a_nonce())
+
+    test.case("poll is a signed power of two and the field runs out at 2^30")
+    f[2] = 127
+    test.assert_eq(ntppkt.poll_seconds(ntppkt.decode(f, 0)), 1073741824)
+
+    test.case("a negative poll exponent is no interval at all")
+    f[2] = 200
+    test.assert_eq(ntppkt.poll_seconds(ntppkt.decode(f, 0)), 0)
+
+    test.case("precision below minus thirty is one microsecond, not zero")
+    f[2] = 6
+    f[3] = 224
+    test.assert_eq(ntppkt.precision_micros(ntppkt.decode(f, 0)), 1)
+
+    test.case("precision of minus twenty rounds up to the whole microsecond")
+    f[3] = 236
+    test.assert_eq(ntppkt.precision_micros(ntppkt.decode(f, 0)), 1)
+
+    test.case("a precision of one second is a million microseconds")
+    f[3] = 0
+    test.assert_eq(ntppkt.precision_micros(ntppkt.decode(f, 0)), 1000000)
+
+    test.case("and the root fields are signed too, so 0xFFFFFFFF is minus one")
+    put32(f, 4, 4294967295)
+    test.assert_eq(ntppkt.root_delay_micros(ntppkt.decode(f, 0)), -15)
+
+    test.case("a dispersion of one second is a million microseconds")
+    put32(f, 4, 0)
+    put32(f, 8, 65536)
+    test.assert_eq(ntppkt.root_dispersion_micros(ntppkt.decode(f, 0)), 1000000)
+
+    test.case("and the server's own error is the dispersion plus half the delay")
+    put32(f, 4, 131072)
+    test.assert_eq(ntppkt.server_error_micros(ntppkt.decode(f, 0)), 2000000)
+
+@test
+fn test_a_kiss_code_is_the_four_characters_it_carries() [io]
+    var f = a_reply(a_nonce())
+    f[1] = 0
+    put32(f, 12, DENY_ID)
+
+    test.case("stratum zero is an instruction rather than a stratum")
+    let p = ntppkt.decode(f, 0)
+    match ntppkt.packet_fault(p)
+        Some(NtpFaultKiss(k)) =>
+            test.assert(ntpfault.kiss_text(k) == "DENY")
+            test.assert(ntpfault.kiss_stops_forever(k))
+            test.assert(not ntpfault.try_another(ntpfault.NtpFaultKiss(k)))
+        Some(_)               => test.assert(false)
+        None                  => test.assert(false)
+
+    test.case("the four characters come back as they arrived")
+    test.assert(ntppkt.reference_text(p) == "DENY")
+    match ntppkt.kiss_of(p)
+        Some(k) => test.assert(ntpfault.kiss_text(k) == "DENY")
+        None    => test.assert(false)
+
+    test.case("a code nobody registered is still a code, carried as it arrived")
+    put32(f, 12, 0x5758595A)
+    match ntppkt.kiss_of(ntppkt.decode(f, 0))
+        Some(k) => test.assert(ntpfault.kiss_text(k) == "WXYZ")
+        None    => test.assert(false)
+
+    test.case("four zero bytes are characters a code is not made of")
+    put32(f, 12, 0)
+    match ntppkt.kiss_of(ntppkt.decode(f, 0))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and a stratum above zero with a text id is not a kiss at all")
+    f[1] = 2
+    put32(f, 12, GPS_ID)
+    match ntppkt.kiss_of(ntppkt.decode(f, 0))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_five_refusals_a_packet_can_carry() [io]
+    let nonce = a_nonce()
+    var f = a_reply(nonce)
+
+    test.case("a mode that is not a server reply")
+    f[0] = (4 << 3) | 3
+    match ntppkt.packet_fault(ntppkt.decode(f, 0))
+        Some(NtpFaultNotAServerReply(mode)) => test.assert_eq(mode, 3)
+        Some(_)                             => test.assert(false)
+        None                                => test.assert(false)
+
+    test.case("a version that is neither 3 nor 4")
+    f[0] = (2 << 3) | 4
+    match ntppkt.packet_fault(ntppkt.decode(f, 0))
+        Some(NtpFaultBadVersion(v)) => test.assert_eq(v, 2)
+        Some(_)                     => test.assert(false)
+        None                        => test.assert(false)
+
+    test.case("a leap indicator of three: the server's clock is not synced")
+    f[0] = (3 << 6) | (4 << 3) | 4
+    match ntppkt.packet_fault(ntppkt.decode(f, 0))
+        Some(NtpFaultUnsynchronised) => test.assert(true)
+        Some(_)                      => test.assert(false)
+        None                         => test.assert(false)
+
+    test.case("a stratum above fifteen")
+    f[0] = (4 << 3) | 4
+    f[1] = 16
+    match ntppkt.packet_fault(ntppkt.decode(f, 0))
+        Some(NtpFaultBadStratum(s)) => test.assert_eq(s, 16)
+        Some(_)                     => test.assert(false)
+        None                        => test.assert(false)
+
+    test.case("a zero transmit timestamp is a server without a time")
+    f[1] = 2
+    put32(f, 40, 0)
+    put32(f, 44, 0)
+    match ntppkt.packet_fault(ntppkt.decode(f, 0))
+        Some(NtpFaultZeroTransmit) => test.assert(true)
+        Some(_)                    => test.assert(false)
+        None                       => test.assert(false)
+
+    test.case("and a good packet has no fault at all")
+    let good = a_reply_packet()
+    match ntppkt.packet_fault(good)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the nonce check is the one that needs the request")
+    match ntpcalc.check(nonce, good)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match ntpcalc.check(ntppkt.timestamp(1, 2), good)
+        Some(NtpFaultNonceMismatch) => test.assert(true)
+        Some(_)                     => test.assert(false)
+        None                        => test.assert(false)
+
+    test.case("and a reply that fails its own checks is refused before the nonce")
+    var mode3 = a_reply(nonce)
+    mode3[0] = (4 << 3) | 3
+    match ntpcalc.check(nonce, ntppkt.decode(mode3, 0))
+        Some(NtpFaultNotAServerReply(_)) => test.assert(true)
+        Some(_)                          => test.assert(false)
+        None                             => test.assert(false)
+
+@test
+fn test_the_buffer_checks_refuse_what_does_not_fit() [io]
+    let req = ntppkt.request(a_nonce())
+
+    test.case("a buffer of exactly forty-eight bytes takes them all")
+    var exact: [u8] = bytes.to_byte_list(bytes.zeros(48))
+    test.assert_eq(ntppkt.encode_into(exact, 0, req), 48)
+
+    test.case("an offset past the end writes nothing rather than too much")
+    test.assert_eq(ntppkt.encode_into(exact, 1, req), 0)
+    test.assert_eq(ntppkt.encode_into(exact, -1, req), 0)
+
+    test.case("and length is a claim the bytes have to back")
+    test.assert(not ntppkt.is_wellformed(exact, 0, 47))
+    test.assert(not ntppkt.is_wellformed(exact, -1, 48))
+    var short: [u8] = bytes.to_byte_list(bytes.zeros(8))
+    test.assert(not ntppkt.is_wellformed(short, 0, 48))
+
+    test.case("a version the client does not speak is not well formed")
+    var v5 = a_reply(a_nonce())
+    v5[0] = (5 << 3) | 4
+    test.assert(not ntppkt.is_wellformed(v5, 0, 48))
+    v5[0] = (3 << 3) | 4
+    test.assert(ntppkt.is_wellformed(v5, 0, 48))
+
+    test.case("and a decode of something shorter answers zeroes, not a crash")
+    let empty = ntppkt.decode(short, 0)
+    test.assert_eq(empty.version, 0)
+    test.assert_eq(empty.stratum, 0)
+    test.assert(ntppkt.timestamp_is_zero(empty.transmit))
+
+@test
+fn test_the_era_rule_round_trips_on_both_sides_of_2036() [io]
+    test.case("the instant the seconds field wraps is era one")
+    let wrap = ntpcalc.timestamp_of_unix(ntpcalc.NTP_ERA1_UNIX_START, 500000)
+    test.assert_eq(ntpcalc.era_of(wrap), 1)
+    test.assert_eq(ntpcalc.unix_seconds_of(wrap), ntpcalc.NTP_ERA1_UNIX_START)
+    test.assert_eq(ntpcalc.fraction_micros(wrap), 500000)
+
+    test.case("a second earlier is era zero, and the subtraction is the same")
+    let before = ntpcalc.timestamp_of_unix(ntpcalc.NTP_ERA1_UNIX_START - 1, 0)
+    test.assert_eq(ntpcalc.era_of(before), 0)
+    test.assert_eq(ntpcalc.unix_seconds_of(before), ntpcalc.NTP_ERA1_UNIX_START - 1)
+
+    test.case("the Unix epoch is 2 208 988 800 seconds into era zero")
+    let epoch = ntpcalc.timestamp_of_unix(0, 0)
+    test.assert_eq(ntpcalc.era_of(epoch), 0)
+    test.assert_eq(epoch.seconds, ntppkt.NTP_UNIX_EPOCH_DELTA)
+    test.assert_eq(ntpcalc.unix_seconds_of(epoch), 0)
+
+@test
+fn test_the_civil_conversions_round_trip_and_refuse() [io]
+    test.case("a timestamp before 1970 is a negative second, not a date in 1900")
+    let before = ntpcalc.timestamp_of_unix(-1, 0)
+    match ntpcalc.civil_of(before)
+        Ok(dt) =>
+            test.assert_eq(dt.date.year, 1969)
+            test.assert_eq(dt.time.hour, 23)
+            test.assert_eq(dt.time.minute, 59)
+            test.assert_eq(dt.time.second, 59)
+        Err(e) => test.fail("civil_of refused the second before the epoch: ${e.message()}")
+
+    test.case("the epoch itself is a civil date")
+    match ntpcalc.civil_of(ntpcalc.timestamp_of_unix(0, 0))
+        Ok(dt) =>
+            test.assert_eq(dt.date.year, 1970)
+            test.assert_eq(dt.date.month, 1)
+            test.assert_eq(dt.date.day, 1)
+        Err(e) => test.fail("civil_of refused the Unix epoch: ${e.message()}")
+
+    test.case("and the other direction answers the second it was given")
+    match ntpcalc.civil_of(ntpcalc.timestamp_of_unix(1234567890, 0))
+        Ok(dt) =>
+            match ntpcalc.unix_seconds_of_civil(dt)
+                Ok(s)  => test.assert_eq(s, 1234567890)
+                Err(e) => test.fail("unix_seconds_of_civil refused a date it made: ${e.message()}")
+        Err(e) => test.fail("civil_of refused 2009-02-13: ${e.message()}")
+
+    test.case("a civil time outside the day is refused rather than moved")
+    // Built field by field, which is what the doc comment on
+    // `unix_seconds_of_civil` says a caller can do — the fields are
+    // public and nothing validates on construction.
+    let bad = CivilDateTime { date: civil.date_from_epoch_day(0),
+                              time: CivilTime { hour: 25, minute: 0, second: 0, nano: 0 } }
+    match ntpcalc.unix_seconds_of_civil(bad)
+        Ok(s)  => test.fail("a 25th hour became the second ${s}")
+        Err(_) => test.assert(true)
+
+    test.case("and a nanosecond past the second is refused too")
+    let nano = CivilDateTime { date: civil.date_from_epoch_day(0),
+                               time: CivilTime { hour: 0, minute: 0, second: 0, nano: 1000000000 } }
+    match ntpcalc.unix_seconds_of_civil(nano)
+        Ok(s)  => test.fail("a billion nanoseconds became the second ${s}")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_better_reading_is_the_faster_one_at_every_tie() [io]
+    let a = NtpReading { offset_micros: 1000, delay_micros: 2000, server_error_micros: 30,
+                         stratum: 2, clamped: false }
+    let b = NtpReading { offset_micros: 4000, delay_micros: 1000, server_error_micros: 90,
+                         stratum: 1, clamped: false }
+
+    test.case("the smaller delay wins even with the worse server behind it")
+    test.assert(ntpcalc.better(b, a))
+    test.assert(not ntpcalc.better(a, b))
+
+    test.case("the same delay is decided by the shallower stratum")
+    let shallow = NtpReading { offset_micros: 0, delay_micros: 1000, server_error_micros: 90,
+                               stratum: 1, clamped: false }
+    let deep = NtpReading { offset_micros: 0, delay_micros: 1000, server_error_micros: 1,
+                            stratum: 5, clamped: false }
+    test.assert(ntpcalc.better(shallow, deep))
+    test.assert(not ntpcalc.better(deep, shallow))
+
+    test.case("and the same stratum is decided by the server's own error")
+    let tight = NtpReading { offset_micros: 0, delay_micros: 1000, server_error_micros: 1,
+                             stratum: 1, clamped: false }
+    let loose = NtpReading { offset_micros: 0, delay_micros: 1000, server_error_micros: 90,
+                             stratum: 1, clamped: false }
+    test.assert(ntpcalc.better(tight, loose))
+    test.assert(not ntpcalc.better(loose, tight))
+
+@test
+fn test_a_reading_is_the_arithmetic_over_four_timestamps() [io]
+    // Fractions that are exact microseconds: 2^30 is a quarter of a
+    // second, 2^31 a half.  A quarter into the leg from the server and
+    // a quarter back leaves the offset at zero and the delay at the
+    // time the packet spent in flight and at the server.
+    let t1 = ntppkt.timestamp(3900000000, 0)
+    let t2 = ntppkt.timestamp(3900000001, 536870912)
+    let t3 = ntppkt.timestamp(3900000002, 268435456)
+    let t4 = ntppkt.timestamp(3900000003, 805306368)
+    let good = a_reply_packet()
+
+    test.case("an exchange that took a quarter of a second each way is no offset")
+    let r = ntpcalc.reading(ntpcalc.exchange(t1, t2, t3, t4), good, 1)
+    test.assert_eq(r.offset_micros, 0)
+    test.assert_eq(r.delay_micros, 2250000)
+    test.assert(not r.clamped)
+    test.assert_eq(r.stratum, 2)
+    test.assert_eq(r.server_error_micros, 0)
+
+    test.case("a reply that echoes the request's own transmit is a negative delay")
+    let echo = ntppkt.timestamp(3900000000, 0)
+    let clamped = ntpcalc.reading(ntpcalc.exchange(t1, echo, ntppkt.timestamp(3900000000, 536870912), echo),
+                                  good, 7)
+    test.assert(clamped.clamped)
+    test.assert_eq(clamped.delay_micros, 7)
+
+    test.case("and the worst case is half the round trip plus the server's error")
+    test.assert_eq(ntpcalc.worst_error_micros(r), 2250000 / 2)
+
+@test
+fn test_every_kiss_code_round_trips_through_its_text() [io]
+    test.case("the five registered codes")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissDeny) == "DENY")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissRstr) == "RSTR")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissRate) == "RATE")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissInit) == "INIT")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissStep) == "STEP")
+    test.assert(ntpfault.kiss_text(ntpfault.NtpKissOther("WXYZ")) == "WXYZ")
+
+    test.case("and the way back is the same mapping")
+    test.assert(ntpfault.kiss_of_text("DENY") == ntpfault.NtpKissDeny)
+    test.assert(ntpfault.kiss_of_text("RSTR") == ntpfault.NtpKissRstr)
+    test.assert(ntpfault.kiss_of_text("RATE") == ntpfault.NtpKissRate)
+    test.assert(ntpfault.kiss_of_text("INIT") == ntpfault.NtpKissInit)
+    test.assert(ntpfault.kiss_of_text("STEP") == ntpfault.NtpKissStep)
+
+    test.case("DENY and RSTR stop forever, RATE does not, and neither does a stranger")
+    test.assert(ntpfault.kiss_stops_forever(ntpfault.NtpKissDeny))
+    test.assert(ntpfault.kiss_stops_forever(ntpfault.NtpKissRstr))
+    test.assert(not ntpfault.kiss_stops_forever(ntpfault.NtpKissRate))
+    test.assert(not ntpfault.kiss_stops_forever(ntpfault.NtpKissOther("WXYZ")))
+
+    test.case("a timeout is worth another server, a refusal is not")
+    test.assert(ntpfault.try_another(ntpfault.NtpFaultTimeout("a.example.org")))
+    test.assert(not ntpfault.try_another(ntpfault.NtpFaultNoServerAnswered(3)))
+
+@test
+fn test_every_fault_has_a_message_a_log_can_carry() [io]
+    test.assert(ntpfault.NtpFaultShortPacket(12).message() == "the reply is 12 bytes and a packet is forty-eight")
+    test.assert(ntpfault.NtpFaultBadVersion(2).message() == "version 2 is not 3 or 4")
+    test.assert(ntpfault.NtpFaultNotAServerReply(3).message() == "mode 3 is not a server reply")
+    test.assert(ntpfault.NtpFaultNonceMismatch.message() == "the reply's originate timestamp is not the nonce this client sent")
+    test.assert(ntpfault.NtpFaultZeroTransmit.message() == "the server answered with a zero transmit timestamp")
+    test.assert(ntpfault.NtpFaultUnsynchronised.message() == "the server's clock is not synchronised")
+    test.assert(ntpfault.NtpFaultKiss(ntpfault.NtpKissDeny).message() == "the server refused with DENY")
+    test.assert(ntpfault.NtpFaultBadStratum(16).message() == "stratum 16 is above 15")
+    test.assert(ntpfault.NtpFaultTooDispersed(5000).message() == "the server's own error is 5000 microseconds, beyond the tolerance")
+    test.assert(ntpfault.NtpFaultTooSlow(5000).message() == "the round trip is 5000 microseconds, beyond the tolerance")
+    test.assert(ntpfault.NtpFaultTransport("no route").message() == "the socket failed: no route")
+    test.assert(ntpfault.NtpFaultTimeout("a.example.org").message() == "no reply from a.example.org inside the timeout")
+    test.assert(ntpfault.NtpFaultNoServerAnswered(3).message() == "no server answered out of 3")
+
+@test
+fn test_the_pool_policy_at_its_boundaries() [io]
+    let p = ntppool.pool(["a.example.org"], 64, 3000)
+
+    test.case("a second server goes on the end of an existing list")
+    let two = ntppool.with_server(p, "b.example.org")
+    test.assert_eq(ntppool.server_count(two), 2)
+    test.assert_eq(ntppool.server_count(ntppool.without(two, "b.example.org")), 1)
+
+    test.case("the poll interval is floored, never refused")
+    test.assert_eq(ntppool.with_poll(p, 5).poll_seconds, ntppool.NTP_MIN_POLL_SECONDS)
+    test.assert_eq(ntppool.with_poll(p, 1024).poll_seconds, 1024)
+
+    test.case("there is no server at a negative attempt or in an empty pool")
+    match ntppool.server_at(p, -1)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match ntppool.server_at(ntppool.empty_pool(), 0)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the attempt count never drops below one")
+    let bare = NtpPool { servers: ["a.example.org"], poll_seconds: 64, timeout_ms: 3000,
+                         max_attempts: 0 }
+    test.assert_eq(ntppool.server_count(bare), 1)
+
+    test.case("a DENY removes the server and a RATE doubles the interval")
+    test.assert_eq(ntppool.server_count(ntppool.after_kiss(two, "a.example.org", ntpfault.NtpKissRstr)), 1)
+    test.assert_eq(ntppool.after_kiss(p, "a.example.org", ntpfault.NtpKissRate).poll_seconds,
+                   64 * ntppool.NTP_RATE_BACKOFF)
+
+@test
+fn test_a_query_against_a_name_that_does_not_resolve() [io, net, time]
+    test.case("no address is a transport fault, not a timeout")
+    match ntpclient.query("no.such.host.invalid", a_nonce(), 500)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.message() == "the socket failed: no address for no.such.host.invalid")
+
+@test
+fn test_a_query_nothing_answers() [io, net, time]
+    // Port 123 on the loopback interface: bound by nothing this sandbox
+    // can start, because the port is below the unprivileged floor.  The
+    // datagram leaves and the deadline passes, which is the timeout
+    // path — the one a real client meets when a server is down.
+    test.case("a reply that never arrives is a timeout")
+    match ntpclient.query("127.0.0.1", a_nonce(), 50)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.message() == "no reply from 127.0.0.1 inside the timeout")
+
+@test
+fn test_a_datagram_the_kernel_refuses_to_send() [io, net, time]
+    test.case("a send failure is reported as one rather than waited on")
+    match ntpclient.query("255.255.255.255", a_nonce(), 50)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(f.message() == "the socket failed: could not send to 255.255.255.255")
+
+@test
+fn test_a_pool_round_over_servers_that_cannot_answer() [io, net, time]
+    let dead = ntppool.pool(["no.such.host.invalid"], 64, 50)
+
+    test.case("a round that asked one server and got nothing says so")
+    match ntpclient.query_pool(dead, [a_nonce()])
+        Ok(_)                                => test.assert(false)
+        Err(NtpFaultNoServerAnswered(tried)) => test.assert_eq(tried, 1)
+        Err(_)                               => test.assert(false)
+
+    test.case("a round with no nonce at all still asks, with the zero timestamp")
+    match ntpclient.query_pool(dead, [])
+        Ok(_)                            => test.assert(false)
+        Err(NtpFaultNoServerAnswered(_)) => test.assert(true)
+        Err(_)                           => test.assert(false)
+
+    test.case("and the best-of round gives up the same way")
+    match ntpclient.query_best(dead, [a_nonce()])
+        Ok(_)                                => test.assert(false)
+        Err(NtpFaultNoServerAnswered(tried)) => test.assert_eq(tried, 1)
+        Err(_)                               => test.assert(false)
+
+    test.case("an empty pool is refused before any of that")
+    match ntpclient.query_pool(ntppool.empty_pool(), [a_nonce()])
+        Ok(_)                            => test.assert(false)
+        Err(NtpFaultNoServerAnswered(0)) => test.assert(true)
+        Err(_)                           => test.assert(false)
+    match ntpclient.query_best(ntppool.empty_pool(), [a_nonce()])
+        Ok(_)                            => test.assert(false)
+        Err(NtpFaultNoServerAnswered(0)) => test.assert(true)
+        Err(_)                           => test.assert(false)
+
+    test.case("and no round opens a socket against a pool with no servers")
+    test.assert_eq(ntppool.server_count(ntppool.empty_pool()), 0)
+
+    test.case("a pool that says zero attempts still asks its one server once")
+    // `NtpPool`'s fields are public, so a caller can build one with a
+    // count its own constructors never produce.  A round that gave up
+    // without asking anybody would be no round at all.
+    let stubborn = NtpPool { servers: ["no.such.host.invalid"], poll_seconds: 64,
+                             timeout_ms: 50, max_attempts: 0 }
+    match ntpclient.query_pool(stubborn, [a_nonce()])
+        Ok(_)                            => test.assert(false)
+        Err(NtpFaultNoServerAnswered(1)) => test.assert(true)
+        Err(_)                           => test.assert(false)
+    match ntpclient.query_best(stubborn, [a_nonce()])
+        Ok(_)                            => test.assert(false)
+        Err(NtpFaultNoServerAnswered(1)) => test.assert(true)
+        Err(_)                           => test.assert(false)
+
+@test
+fn test_the_clock_reads_bracket_an_exchange() [io, time]
+    test.case("now_timestamp reads the machine's clock, in era zero")
+    let now = ntpclient.now_timestamp()
+    test.assert_eq(ntpcalc.era_of(now), 0)
+    test.assert(ntpcalc.unix_seconds_of(now) > 1700000000)
+
+    test.case("and the precision is never zero")
+    test.assert(ntpclient.clock_precision_micros() >= 1)
+
+@test
+fn test_the_reading_and_the_correction_a_caller_holds() [io]
+    let good = a_reply_packet()
+    let e = ntpcalc.exchange(ntppkt.timestamp(3900000000, 0),
+                             ntppkt.timestamp(3900000000, 429496729),
+                             ntppkt.timestamp(3900000000, 858993459),
+                             ntppkt.timestamp(3900000000, 429496729))
+    let r = ntpcalc.reading(e, good, 1)
+    let a = NtpAnswer { server: "a.example.org", offset_micros: r.offset_micros,
+                        delay_micros: r.delay_micros, server_error_micros: r.server_error_micros,
+                        stratum: r.stratum, clamped: r.clamped, leap: good.leap,
+                        reference_id: good.reference_id,
+                        server_poll_seconds: ntppkt.poll_seconds(good) }
+
+    test.case("the answer rebuilds the reading the arithmetic takes")
+    let back = ntpclient.reading_of(a)
+    test.assert_eq(back.offset_micros, r.offset_micros)
+    test.assert_eq(back.delay_micros, r.delay_micros)
+    test.assert_eq(back.stratum, r.stratum)
+    test.assert_eq(back.clamped, r.clamped)
+
+    test.case("a reading inside the caller's tolerance is a correction")
+    match ntpclient.correction_micros(a, 100000000)
+        Some(v) => test.assert_eq(v, r.offset_micros)
+        None    => test.assert(false)
+
+    test.case("and one outside it is not worth acting on")
+    match ntpclient.correction_micros(a, -1)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the reference id and the poll interval cross into the answer")
+    test.assert_eq(a.reference_id, GPS_ID)
+    test.assert_eq(a.server_poll_seconds, 64)

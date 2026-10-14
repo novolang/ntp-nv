@@ -1,0 +1,22 @@
+// hostile_tests.nv — a server that answers every query with a RATE kiss.
+
+use std.test
+use ntpfault
+use ntppool
+
+@test
+fn test_repeated_rate_kisses_stop_at_the_longest_poll() [io]
+    var p = ntppool.pool(["a.example.org"], 64, 3000)
+    for _ in 0..200
+        p = ntppool.after_kiss(p, "a.example.org", NtpKissRate)
+    test.assert_eq(p.poll_seconds, 131072)
+
+@test
+fn test_a_rate_kiss_still_doubles_below_the_ceiling() [io]
+    let p = ntppool.pool(["a.example.org"], 64, 3000)
+    test.assert_eq(ntppool.after_kiss(p, "a.example.org", NtpKissRate).poll_seconds, 128)
+
+@test
+fn test_a_pool_set_above_the_ceiling_keeps_its_interval() [io]
+    let p = ntppool.pool(["a.example.org"], 200000, 3000)
+    test.assert_eq(ntppool.after_kiss(p, "a.example.org", NtpKissRate).poll_seconds, 200000)

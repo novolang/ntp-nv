@@ -1,7 +1,5 @@
 // ntppool.nv — which server to ask, and when to stop asking.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  A policy is a value; nothing here resolves a name
 // or opens a socket.
 //
@@ -13,16 +11,19 @@
 // author never saw the rule, because the library hid the poll loop.
 //
 // So the minimum interval is a named constant with the reason beside
-// it, `after_kiss` is what a kiss code does to the list, and there is
-// no function in this package that loops.  `ntpclient.query` asks ONE
-// server ONCE; the schedule is the caller's and it is visible in the
-// caller's code.
+// it, `after_kiss` is what a kiss code does to the list, and no
+// function here or in `ntpclient` waits.  `ntpclient.query` asks ONE
+// server ONCE, and a pool round asks each server in the list at most
+// once and gives up at `max_attempts`; the schedule between rounds is
+// the caller's and it is visible in the caller's code.
 //
 // AND THE DEFAULT LIST IS EMPTY.  A library that shipped
 // `pool.ntp.org` as a default sends every program that forgot to
 // configure one to a volunteer service, under this library's name.  The
 // README names the pool and its rules; the code makes the caller type
 // it.
+
+use ntpfault
 
 // The shortest interval a client may poll ONE server at, in seconds.
 //
@@ -41,6 +42,11 @@ pub const POOL_MIN_POLL_SECONDS = 64
 // successful reply is a client that oscillates into the same refusal.
 pub const NTP_RATE_BACKOFF = 2
 
+// The longest interval a `RATE` kiss can back the poll off to, in
+// seconds: 2^17, the largest poll exponent RFC 5905 allows.  A pool the
+// caller already set above it keeps its interval.
+const MAX_BACKOFF_SECONDS = 131072
+
 // A list of servers and the rules for asking them.
 pub struct NtpPool
     // Hostnames or addresses, in the order they will be tried.  EMPTY
@@ -54,6 +60,33 @@ pub struct NtpPool
     // How many servers to try before giving up on a round.
     max_attempts: Int
 
+// THE FLOOR AND THE ATTEMPT COUNT, applied in one place each.  A pool
+// is a policy a caller builds and hands to a client, so the two
+// numbers that carry the obligation are computed here rather than at
+// the call sites that could each forget one.
+//
+// `@tier(app)` is on every function in this module: a pool holds a
+// `[Str]` and a boxed struct, and a boxed struct is what a device
+// cannot allocate.  The device half of this package is `ntppkt` and
+// `ntpcalc`; this module is the host's policy.
+@tier(app)
+fn floor_poll(seconds: Int) -> Int
+    if seconds < NTP_MIN_POLL_SECONDS
+        NTP_MIN_POLL_SECONDS
+    else
+        seconds
+
+// One attempt per server, and never fewer than one: a round that gives
+// up without asking anybody is not a round.  `pool`, `with_server` and
+// `without` all go through here, so the field cannot drift away from
+// the list it is counting.
+@tier(app)
+fn attempts_for(count: Int) -> Int
+    if count < 1
+        1
+    else
+        count
+
 // A pool from a list of servers.
 //
 // ```novo
@@ -62,8 +95,12 @@ pub struct NtpPool
 // fn p() -> NtpPool
 //     ntppool.pool(["time.example.org"], 64, 3000)
 // ```
-pub fn pool(servers: [Str], poll_seconds: Int, timeout_ms: Int) -> NtpPool []
-    todo("ntp-nv.ntppool.pool")
+pub @tier(app)
+fn pool(servers: [Str], poll_seconds: Int, timeout_ms: Int) -> NtpPool []
+    NtpPool { servers: servers,
+              poll_seconds: floor_poll(poll_seconds),
+              timeout_ms: timeout_ms,
+              max_attempts: attempts_for(list.len(servers)) }
 
 // A pool with no servers at all.
 //
@@ -71,19 +108,39 @@ pub fn pool(servers: [Str], poll_seconds: Int, timeout_ms: Int) -> NtpPool []
 // `ntpclient.query_pool` refuses to work with — loudly, because the
 // alternative is a silent default pointing at somebody else's
 // volunteers.
-pub fn empty_pool() -> NtpPool []
-    todo("ntp-nv.ntppool.empty_pool")
+pub @tier(app)
+fn empty_pool() -> NtpPool []
+    NtpPool { servers: [],
+              poll_seconds: POOL_MIN_POLL_SECONDS,
+              timeout_ms: 3000,
+              max_attempts: 1 }
 
 // The same pool with one more server at the end.
-pub fn with_server(p: NtpPool, server: Str) -> NtpPool []
-    todo("ntp-nv.ntppool.with_server")
+pub @tier(app)
+fn with_server(p: NtpPool, server: Str) -> NtpPool []
+    var servers: [Str] = []
+    for s in p.servers
+        list.push(servers, s)
+    list.push(servers, server)
+    NtpPool { servers: servers,
+              poll_seconds: p.poll_seconds,
+              timeout_ms: p.timeout_ms,
+              max_attempts: attempts_for(list.len(servers)) }
 
 // The same pool without one server.
 //
 // What a `DENY` or `RSTR` kiss does: the server is gone for this
 // process, not skipped for one round.
-pub fn without(p: NtpPool, server: Str) -> NtpPool []
-    todo("ntp-nv.ntppool.without")
+pub @tier(app)
+fn without(p: NtpPool, server: Str) -> NtpPool []
+    var kept: [Str] = []
+    for s in p.servers
+        if s != server
+            list.push(kept, s)
+    NtpPool { servers: kept,
+              poll_seconds: p.poll_seconds,
+              timeout_ms: p.timeout_ms,
+              max_attempts: attempts_for(list.len(kept)) }
 
 // The pool a kiss code leaves behind.
 //
@@ -99,35 +156,61 @@ pub fn without(p: NtpPool, server: Str) -> NtpPool []
 // fn obey(p: NtpPool, server: Str, k: NtpKiss) -> NtpPool
 //     ntppool.after_kiss(p, server, k)
 // ```
-pub fn after_kiss(p: NtpPool, server: Str, k: NtpKiss) -> NtpPool []
-    todo("ntp-nv.ntppool.after_kiss")
+pub @tier(app)
+fn after_kiss(p: NtpPool, server: Str, k: NtpKiss) -> NtpPool []
+    if ntpfault.kiss_stops_forever(k)
+        without(p, server)
+    else
+        with_poll(p, backed_off(p.poll_seconds))
+
+// The interval after one `RATE` kiss: doubled, and no further than
+// `MAX_BACKOFF_SECONDS`.
+@tier(app)
+fn backed_off(seconds: Int) -> Int
+    if seconds >= MAX_BACKOFF_SECONDS
+        seconds
+    elif seconds > MAX_BACKOFF_SECONDS / NTP_RATE_BACKOFF
+        MAX_BACKOFF_SECONDS
+    else
+        seconds * NTP_RATE_BACKOFF
 
 // The same pool at a different poll interval, clamped at the floor.
 //
 // Clamped rather than refused, because a caller asking for five seconds
 // wants "as often as allowed" and a refusal there is a program that
 // does not start.
-pub fn with_poll(p: NtpPool, seconds: Int) -> NtpPool []
-    todo("ntp-nv.ntppool.with_poll")
+pub @tier(app)
+fn with_poll(p: NtpPool, seconds: Int) -> NtpPool []
+    NtpPool { servers: p.servers,
+              poll_seconds: floor_poll(seconds),
+              timeout_ms: p.timeout_ms,
+              max_attempts: p.max_attempts }
 
 // The server to ask on attempt `n`, counting from zero.
 //
 // Round-robin over the list.  Published rather than looped internally
 // so a caller can see, in its own code, how many servers one round
 // costs a volunteer service.
-pub fn server_at(p: NtpPool, n: Int) -> ?Str []
-    todo("ntp-nv.ntppool.server_at")
+pub @tier(app)
+fn server_at(p: NtpPool, n: Int) -> ?Str []
+    let count = list.len(p.servers)
+    if count == 0 or n < 0
+        None
+    else
+        Some(list.get(p.servers, n % count))
 
 // How many servers the pool holds.
-pub fn server_count(p: NtpPool) -> Int []
-    todo("ntp-nv.ntppool.server_count")
+pub @tier(app)
+fn server_count(p: NtpPool) -> Int []
+    list.len(p.servers)
 
 // Whether a pool can be used at all.
 //
 // False for an empty list, which is the default — see the module
 // comment.
-pub fn is_usable(p: NtpPool) -> Bool []
-    todo("ntp-nv.ntppool.is_usable")
+pub @tier(app)
+fn is_usable(p: NtpPool) -> Bool []
+    not list.is_empty(p.servers)
 
 // The next poll interval after a reply, in seconds.
 //
@@ -136,5 +219,9 @@ pub fn is_usable(p: NtpPool) -> Bool []
 // every 1024 seconds" has said something a client is expected to obey,
 // and a client that kept its own 64 is ignoring an instruction that is
 // in every reply.
-pub fn next_poll_seconds(p: NtpPool, server_poll_seconds: Int) -> Int []
-    todo("ntp-nv.ntppool.next_poll_seconds")
+pub @tier(app)
+fn next_poll_seconds(p: NtpPool, server_poll_seconds: Int) -> Int []
+    if server_poll_seconds > p.poll_seconds
+        server_poll_seconds
+    else
+        p.poll_seconds

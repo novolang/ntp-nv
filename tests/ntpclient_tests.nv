@@ -1,11 +1,6 @@
 // ntpclient_tests.nv — the pool policy, and the rest of the public
 // surface named from outside the package.
 //
-// RED ON PURPOSE, like `ntpwire_tests.nv`: the first `todo()` each
-// function reaches ends it.  What the socket-side assertions check
-// before that is that every signature in the package can be spelled by
-// a consumer, with the types a consumer holds.
-//
 // THE SOCKET FUNCTIONS ARE NAMED THROUGH A FUNCTION THAT IS NEVER
 // REACHED.  `over_a_real_socket` names `query`, `query_pool`,
 // `query_best` and `exchange_with` with their `[net, time]` row; it is
@@ -128,7 +123,7 @@ fn test_the_codec_writes_into_a_buffer_the_caller_sized() [io]
     // A `@value` packet and a caller's buffer: nothing in the encode
     // path allocates, which is what lets a device hold one.
     test.case("forty-eight bytes go into a forty-eight byte buffer")
-    let out = [0, 0, 0, 0, 0, 0, 0, 0]
+    var out = [0, 0, 0, 0, 0, 0, 0, 0]
     test.assert_eq(ntppkt.encode_into(out, 0, ntppkt.request(a_nonce())), 0)
 
     test.case("and a decode reads a packet back out of bytes")
@@ -137,9 +132,12 @@ fn test_the_codec_writes_into_a_buffer_the_caller_sized() [io]
 
 @test
 fn test_the_civil_conversions_are_the_one_pair_a_device_does_without() [io]
-    // `unix_seconds_of_civil` answers an INTEGER because a `@value`
-    // struct may not be a `Result` payload — the caller pipes it
-    // through `timestamp_of_unix`, which cannot fail.
+    // `unix_seconds_of_civil` answers an INTEGER because seconds is what
+    // the caller has and `timestamp_of_unix` turns a number into a
+    // timestamp without failing.  (The interface release gave the reason
+    // as "a `@value` struct may not be a `Result` payload"; that is
+    // false — a `@value` crosses a `Result` payload by boxing a copy,
+    // which is why `@tier(embedded)` refuses one and the host does not.)
     test.case("the fallible direction answers a number")
     match ntpcalc.unix_seconds_of_civil(civil.datetime(civil.date_from_epoch_day(0),
                                                        civil.midnight()))

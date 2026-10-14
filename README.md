@@ -11,11 +11,9 @@ implementation does. It is built on
 [calendar-nv](https://novo-lang.org/packages/calendar-nv), for the one
 conversion from a timestamp to a civil date.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
+This is the implementation of the interface released as 0.0.3: every
+function has a body, the suites under `tests/` pass, and `CHANGELOG.md`
+records what changed and what is known.
 
 ## What SNTP is
 
@@ -108,10 +106,8 @@ fn main() [io, net, time]
         Err(fault) => println(fault.message())
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: ntp-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The suites and
+what each one covers are listed under [Tests](#tests).
 
 ## What the package contains
 
@@ -209,8 +205,10 @@ a test takes, because none of it reads a clock or opens a socket.
     `root_dispersion + root_delay / 2`.
     `ntpcalc.worst_error_micros` adds half the round trip to it, which
     is how wrong the whole reading may be.
-11. **This package contains no loop and no default server.** `query`
-    asks one server once. The poll schedule is yours and lives in your
+11. **This package waits on nothing and ships no default server.**
+    `query` asks one server once; a pool round asks each server in the
+    list at most once and gives up at `max_attempts`. Neither waits
+    between attempts — the poll schedule is yours and lives in your
     code. `NtpPool`'s server list starts empty, and `query_pool`
     refuses an empty pool rather than falling back to somebody else's
     volunteers. RFC 4330 section 10 sets the floor at 15 seconds
@@ -221,9 +219,10 @@ a test takes, because none of it reads a clock or opens a socket.
     expects to be obeyed, and `ntppool.next_poll_seconds` takes the
     longer of that and yours.
 13. **A fallible conversion answers a number, not a timestamp.**
-    `ntpcalc.unix_seconds_of_civil` answers `Result<Int, CalError>`,
-    because the language refuses a `@value` struct as a `Result`
-    payload and `NtpTimestamp` is one. Pipe the number through
+    `ntpcalc.unix_seconds_of_civil` answers `Result<Int, CalError>`
+    rather than `Result<NtpTimestamp, CalError>`, because a `Result`
+    carrying a `@value` struct boxes a copy of it — an allocation the
+    embedded tier refuses — and the caller pipes the number through
     `ntpcalc.timestamp_of_unix`, which cannot fail.
 
 ## Running on a microcontroller
@@ -233,16 +232,35 @@ with no heap allocator, and the compiler checks that claim on every
 build. Here the claim covers `ntppkt` and `ntpcalc`: the timestamp and
 packet types, the codec, the fixed-point readers, the offset and delay
 arithmetic and the era rule. All of it is integer arithmetic over two
-thirty-two-bit halves.
-
-```bash
-novo build --target=nrf52-qemu src/main.nv
-```
+thirty-two-bit halves, and every function it names carries
+`@tier(embedded)` — `ntpcalc.check`, which constructs `?NtpFault`
+payloads, is `@tier(rt)`, and the two civil conversions below are
+`@tier(app)`.
 
 `tests/embedded_probe.nv` is that claim as a program that either builds
-or does not. It builds a Cortex-M4 executable that runs eighteen checks
-over the timestamp type, the two fixed-point scales, the era rule, the
-offset, the delay and its clamp.
+or does not: eighteen checks over the timestamp type, the two
+fixed-point scales, the era rule, the offset, the delay and its clamp.
+The checks themselves are held green by running the same file as a host
+program — `score()` answers 18 — while the device build is the half
+that is blocked, below. It is built from `src/`, because a build of a
+file under `tests/` resolves the package's modules but not its
+dependencies:
+
+```bash
+cp tests/embedded_probe.nv src/zz_probe_tmp.nv
+novo build --target=nrf52-qemu src/zz_probe_tmp.nv
+rm src/zz_probe_tmp.nv
+```
+
+**That build is red today, and nothing in this package is what stops
+it.** A device build checks every function it loads that carries no
+`@tier` at `@tier(embedded)`, fail-closed, and this package's one
+dependency, calendar-nv, annotates no function in any of its modules.
+The build answers fifteen `E4000` errors and every one of them is
+inside calendar-nv 0.2.1's `calerror.nv` and `civil.nv` — a
+payload-carrying `Result`, a tuple literal and an interpolated string,
+each refused at the embedded tier. This package's five modules answer
+none.
 
 **A device cannot depend on this package as a whole.** `ntpclient`
 names `std.net`, and one host-only function anywhere in a compilation
@@ -252,8 +270,9 @@ the firmware calls it. The probe above is built against `ntppkt` and
 separately, firmware that wants them copies them or waits.
 
 `ntpcalc.civil_of` and `ntpcalc.unix_seconds_of_civil` are outside the
-claim as well. They name calendar-nv's types, and a device adding an
-offset to its own counter wants the integer rather than the calendar.
+claim as well. They are `@tier(app)`, they name calendar-nv's types,
+and a device adding an offset to its own counter wants the integer
+rather than the calendar.
 
 On a device the nonce comes from a hardware random number generator,
 which is the firmware's business rather than this package's. A device
@@ -263,18 +282,19 @@ than one with none.
 
 ## What is not included
 
-- **A UDP socket that can carry binary.** `std.net`'s
-  `udp_recv_from` answers a string the runtime terminates at the first
-  zero byte. An NTP packet's second byte is the stratum, which is zero
-  in every kiss-o'-death reply, its fourth is a signed precision, and
-  the root delay is usually zeroes, so almost no reply survives that
-  API intact. `ntpclient`'s signatures are written against a datagram
-  API that answers bytes, beside the `send_bytes` and `recv_bytes` pair
-  the standard library's TCP already has. Until that exists,
-  `ntppkt` and `ntpcalc` with your own transport are the working path.
-  Binding a datagram socket to a specific local address, an IPv6
-  datagram socket, and a documented receive timeout on a datagram
-  socket are absent for the same reason.
+- **A datagram API that answers `Bytes`.** `std.net`'s
+  `udp_recv_from` answers a `Str` whose length is the one the kernel
+  reported, so a zero byte in the payload is a byte like any other, and
+  `ntpclient` sends its request as a `Str` for the same reason — see
+  `CHANGELOG.md` § Known. What is missing is the byte-typed half of the
+  pair the standard library's TCP already has, and `net.udp_send_to`'s
+  `data: Any` does not take a `Bytes` payload: a `Bytes` handed to it
+  goes out as the buffer's length word (little-endian, cut at its first
+  zero byte — `30` for a forty-eight byte frame) and the call still
+  answers `true`. Filed as
+  `stdlib/net-udp-send-to-sends-a-bytes-payload-as-its-length-word`. A
+  datagram socket from `net.udp_socket` is an IPv4 socket and the page
+  documents no IPv6 sibling for it.
 - **Clock discipline.** This package answers an offset. It does not
   step the clock, slew it or write a drift file. See rule 3.
 - **The peer filter, the clock filter and the intersection algorithm.**
@@ -322,6 +342,7 @@ than one with none.
 ```bash
 novo test tests/ntpwire_tests.nv      # 13 tests: the packet and the arithmetic
 novo test tests/ntpclient_tests.nv    #  9 tests: the pool and the client surface
+novo test tests/ntp_edge_tests.nv     # 18 tests: the boundaries and the transport
 ```
 
 The reference implementations are `ntplib` for the shape of the client
@@ -330,43 +351,33 @@ is the specification the client implements, RFC 5905 section 7.3 is
 where the packet format lives, and RFC 5905 section 8 is where the
 delay clamp comes from.
 
-No test opens a socket or reads a clock. The four timestamps, the nonce
-and the client's own precision are all arguments, so a whole exchange
-is a value the test writes out and the same bytes produce the same
-offset on every run. The suite checks that a reply must echo the nonce,
-that an unsynchronised server is refused, that a mode-3 reply is this
-client's own request coming back, that a kiss-o'-death is read as an
-instruction before its stratum is read, that the two fixed-point scales
-are not the same scale, that the era rule is not a subtraction, that a
-negative delay is clamped rather than refused, that the better of two
-readings is the faster and not the newer, and that an empty pool
-refuses rather than falling back.
+The first two suites open no socket and read no clock. The four
+timestamps, the nonce and the client's own precision are all arguments,
+so a whole exchange is a value the test writes out and the same bytes
+produce the same offset on every run. They check that a reply must echo
+the nonce, that an unsynchronised server is refused, that a mode-3
+reply is this client's own request coming back, that a kiss-o'-death is
+read as an instruction before its stratum is read, that the two
+fixed-point scales are not the same scale, that the era rule is not a
+subtraction, that a negative delay is clamped rather than refused, that
+the better of two readings is the faster and not the newer, and that an
+empty pool refuses rather than falling back.
 
-The tests compile today and fail at run, each on the
-`not implemented: ntp-nv.<module>.<fn>` panic that is its body. That is
-the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `ntppkt.NTP_PACKET_BYTES`, `.NTP_PORT`, `.NTP_VERSION`, `.NTP_MODE_CLIENT`, `.NTP_MODE_SERVER`, `.NTP_UNIX_EPOCH_DELTA`, `.NTP_MAX_STRATUM` | yes (they are constants) |
-| `ntpcalc.NTP_ERA1_UNIX_START` | yes (it is a constant) |
-| `ntppool.NTP_MIN_POLL_SECONDS`, `.POOL_MIN_POLL_SECONDS`, `.NTP_RATE_BACKOFF` | yes (they are constants) |
-| `ntppkt.timestamp`, `.zero_timestamp`, `.timestamp_eq`, `.timestamp_is_zero`, `.request` | no |
-| `ntppkt.encode_into`, `.is_wellformed`, `.decode`, `.packet_fault` | no |
-| `ntppkt.reference_text`, `.kiss_of`, `.is_kiss` | no |
-| `ntppkt.root_delay_micros`, `.root_dispersion_micros`, `.server_error_micros`, `.poll_seconds`, `.precision_micros` | no |
-| `ntpcalc.exchange`, `.check`, `.offset_micros`, `.delay_micros`, `.delay_was_clamped`, `.reading` | no |
-| `ntpcalc.worst_error_micros`, `.better` | no |
-| `ntpcalc.unix_seconds_of`, `.timestamp_of_unix`, `.era_of`, `.fraction_micros` | no |
-| `ntpcalc.civil_of`, `.unix_seconds_of_civil` | no |
-| `ntpfault.kiss_text`, `.kiss_of_text`, `.kiss_stops_forever`, `.try_another`, `NtpFault.message` | no |
-| `ntppool.pool`, `.empty_pool`, `.with_server`, `.without`, `.after_kiss`, `.with_poll` | no |
-| `ntppool.server_at`, `.server_count`, `.is_usable`, `.next_poll_seconds` | no |
-| `ntpclient.query`, `.query_pool`, `.query_best`, `.exchange_with` | no |
-| `ntpclient.now_timestamp`, `.clock_precision_micros`, `.reading_of`, `.correction_micros` | no |
+`ntp_edge_tests.nv` is the third suite, and it is where the boundaries
+live: a poll exponent past 2^30, a precision of minus thirty-two, the
+byte the packet calls signed, a kiss code nobody registered, a buffer
+one byte too small, an era-1 timestamp, a second before 1970, every
+fault's message, and the three transport failures a client has when
+there is no server to talk to — a name that does not resolve, a port
+nothing answers on, and an address the kernel refuses to send to. It
+does open sockets and read the clock, which is why it is its own file:
+the answers a real server gives need a server on port 123, and that
+port is below the unprivileged floor, so the six regions in
+`ntpclient.nv` that only a reply that arrived reaches carry a
+`cov: skip` marker naming that reason rather than a test that would
+have to fake one. The two `server_at` guards in the round functions and
+the unopenable-socket arm are marked for their own reasons, stated on
+each marker.
 
 ## Licence
 

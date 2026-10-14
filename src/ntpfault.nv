@@ -1,7 +1,5 @@
 // ntpfault.nv — what an SNTP exchange can answer other than a time.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.
 //
 // THE LIST IS RFC 4330 § 5's, AND IT IS A LIST BECAUSE EVERY ITEM ON IT
@@ -80,8 +78,15 @@ pub enum NtpFault
     NtpFaultNoServerAnswered(tried: Int)
 
 // The four characters a kiss code is written as on the wire.
-pub fn kiss_text(k: NtpKiss) -> Str []
-    todo("ntp-nv.ntpfault.kiss_text")
+pub @tier(embedded)
+fn kiss_text(k: NtpKiss) -> Str []
+    match k
+        NtpKissDeny        => "DENY"
+        NtpKissRstr        => "RSTR"
+        NtpKissRate        => "RATE"
+        NtpKissInit        => "INIT"
+        NtpKissStep        => "STEP"
+        NtpKissOther(code) => code
 
 // The kiss code four bytes of reference id name.
 //
@@ -91,8 +96,15 @@ pub fn kiss_text(k: NtpKiss) -> Str []
 // fn stop(code: Str) -> Bool
 //     ntpfault.kiss_stops_forever(ntpfault.kiss_of_text(code))
 // ```
-pub fn kiss_of_text(code: Str) -> NtpKiss []
-    todo("ntp-nv.ntpfault.kiss_of_text")
+pub @tier(rt)
+fn kiss_of_text(code: Str) -> NtpKiss []
+    match code
+        "DENY" => NtpKissDeny
+        "RSTR" => NtpKissRstr
+        "RATE" => NtpKissRate
+        "INIT" => NtpKissInit
+        "STEP" => NtpKissStep
+        _      => NtpKissOther(code)
 
 // Whether a kiss code means "never ask this server again".
 //
@@ -101,16 +113,24 @@ pub fn kiss_of_text(code: Str) -> NtpKiss []
 // backwards in either direction is bad: treating `RATE` as permanent
 // loses a working server, and treating `DENY` as temporary is what
 // gets an address range banned.
-pub fn kiss_stops_forever(k: NtpKiss) -> Bool []
-    todo("ntp-nv.ntpfault.kiss_stops_forever")
+pub @tier(embedded)
+fn kiss_stops_forever(k: NtpKiss) -> Bool []
+    match k
+        NtpKissDeny => true
+        NtpKissRstr => true
+        _           => false
 
 // Whether a fault is worth trying another server for.
 //
 // A timeout and a transport failure are; a kiss code that stops
 // forever is not, for THIS server, and `ntppool.without` is how it
 // leaves the list.
-pub fn try_another(f: NtpFault) -> Bool []
-    todo("ntp-nv.ntpfault.try_another")
+pub @tier(embedded)
+fn try_another(f: NtpFault) -> Bool []
+    match f
+        NtpFaultKiss(k)             => not kiss_stops_forever(k)
+        NtpFaultNoServerAnswered(_) => false
+        _                           => true
 
 // What went wrong, in one line.
 //
@@ -121,5 +141,19 @@ pub fn try_another(f: NtpFault) -> Bool []
 //     f.message()
 // ```
 impl Error for NtpFault
+    @tier(app)
     fn message(self) -> Str
-        todo("ntp-nv.ntpfault.NtpFault.message")
+        match self
+            NtpFaultShortPacket(got)               => "the reply is ${got} bytes and a packet is forty-eight"
+            NtpFaultBadVersion(version)            => "version ${version} is not 3 or 4"
+            NtpFaultNotAServerReply(mode)          => "mode ${mode} is not a server reply"
+            NtpFaultNonceMismatch                  => "the reply's originate timestamp is not the nonce this client sent"
+            NtpFaultZeroTransmit                   => "the server answered with a zero transmit timestamp"
+            NtpFaultUnsynchronised                 => "the server's clock is not synchronised"
+            NtpFaultKiss(k)                        => "the server refused with ${kiss_text(k)}"
+            NtpFaultBadStratum(stratum)            => "stratum ${stratum} is above 15"
+            NtpFaultTooDispersed(max_error_micros) => "the server's own error is ${max_error_micros} microseconds, beyond the tolerance"
+            NtpFaultTooSlow(delay_micros)          => "the round trip is ${delay_micros} microseconds, beyond the tolerance"
+            NtpFaultTransport(detail)              => "the socket failed: ${detail}"
+            NtpFaultTimeout(server)                => "no reply from ${server} inside the timeout"
+            NtpFaultNoServerAnswered(tried)        => "no server answered out of ${tried}"
