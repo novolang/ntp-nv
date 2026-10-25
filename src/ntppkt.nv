@@ -284,17 +284,17 @@ fn encode_into(var out: [u8], at: Int, p: NtpPacket) -> Int []
         out[at + 1] = p.stratum & 255
         out[at + 2] = p.poll & 255
         out[at + 3] = p.precision & 255
-        put_u32(out, at + 4, p.root_delay)
-        put_u32(out, at + 8, p.root_dispersion)
-        put_u32(out, at + 12, p.reference_id)
-        put_u32(out, at + 16, p.reference_time.seconds)
-        put_u32(out, at + 20, p.reference_time.fraction)
-        put_u32(out, at + 24, p.originate.seconds)
-        put_u32(out, at + 28, p.originate.fraction)
-        put_u32(out, at + 32, p.receive.seconds)
-        put_u32(out, at + 36, p.receive.fraction)
-        put_u32(out, at + 40, p.transmit.seconds)
-        put_u32(out, at + 44, p.transmit.fraction)
+        put_u32(var out, at + 4, p.root_delay)
+        put_u32(var out, at + 8, p.root_dispersion)
+        put_u32(var out, at + 12, p.reference_id)
+        put_u32(var out, at + 16, p.reference_time.seconds)
+        put_u32(var out, at + 20, p.reference_time.fraction)
+        put_u32(var out, at + 24, p.originate.seconds)
+        put_u32(var out, at + 28, p.originate.fraction)
+        put_u32(var out, at + 32, p.receive.seconds)
+        put_u32(var out, at + 36, p.receive.fraction)
+        put_u32(var out, at + 40, p.transmit.seconds)
+        put_u32(var out, at + 44, p.transmit.fraction)
         NTP_PACKET_BYTES
 
 // Whether these bytes can be decoded at all.

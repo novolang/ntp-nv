@@ -47,13 +47,13 @@ fn a_reply(nonce: NtpTimestamp) -> [u8]
     f[1] = 2
     f[2] = 6
     f[3] = 236
-    put32(f, 12, GPS_ID)
-    put32(f, 24, nonce.seconds)
-    put32(f, 28, nonce.fraction)
-    put32(f, 32, 3900000120)
-    put32(f, 36, 0)
-    put32(f, 40, 3900000123)
-    put32(f, 44, 0x80000000)
+    put32(var f, 12, GPS_ID)
+    put32(var f, 24, nonce.seconds)
+    put32(var f, 28, nonce.fraction)
+    put32(var f, 32, 3900000120)
+    put32(var f, 36, 0)
+    put32(var f, 40, 3900000123)
+    put32(var f, 44, 0x80000000)
     f
 
 fn a_nonce() -> NtpTimestamp
@@ -68,7 +68,7 @@ fn test_a_request_round_trips_through_forty_eight_bytes() [io]
 
     test.case("the encoder fills the caller's buffer and says how much it wrote")
     var frame: [u8] = bytes.to_byte_list(bytes.zeros(ntppkt.NTP_PACKET_BYTES))
-    test.assert_eq(ntppkt.encode_into(frame, 0, req), ntppkt.NTP_PACKET_BYTES)
+    test.assert_eq(ntppkt.encode_into(var frame, 0, req), ntppkt.NTP_PACKET_BYTES)
 
     test.case("the version and mode are the two the request is made of")
     test.assert_eq(frame[0], (4 << 3) | 3)
@@ -125,23 +125,23 @@ fn test_a_byte_the_packet_calls_signed_crosses_as_one() [io]
     test.assert_eq(ntppkt.precision_micros(ntppkt.decode(f, 0)), 1000000)
 
     test.case("and the root fields are signed too, so 0xFFFFFFFF is minus one")
-    put32(f, 4, 4294967295)
+    put32(var f, 4, 4294967295)
     test.assert_eq(ntppkt.root_delay_micros(ntppkt.decode(f, 0)), -15)
 
     test.case("a dispersion of one second is a million microseconds")
-    put32(f, 4, 0)
-    put32(f, 8, 65536)
+    put32(var f, 4, 0)
+    put32(var f, 8, 65536)
     test.assert_eq(ntppkt.root_dispersion_micros(ntppkt.decode(f, 0)), 1000000)
 
     test.case("and the server's own error is the dispersion plus half the delay")
-    put32(f, 4, 131072)
+    put32(var f, 4, 131072)
     test.assert_eq(ntppkt.server_error_micros(ntppkt.decode(f, 0)), 2000000)
 
 @test
 fn test_a_kiss_code_is_the_four_characters_it_carries() [io]
     var f = a_reply(a_nonce())
     f[1] = 0
-    put32(f, 12, DENY_ID)
+    put32(var f, 12, DENY_ID)
 
     test.case("stratum zero is an instruction rather than a stratum")
     let p = ntppkt.decode(f, 0)
@@ -160,20 +160,20 @@ fn test_a_kiss_code_is_the_four_characters_it_carries() [io]
         None    => test.assert(false)
 
     test.case("a code nobody registered is still a code, carried as it arrived")
-    put32(f, 12, 0x5758595A)
+    put32(var f, 12, 0x5758595A)
     match ntppkt.kiss_of(ntppkt.decode(f, 0))
         Some(k) => test.assert(ntpfault.kiss_text(k) == "WXYZ")
         None    => test.assert(false)
 
     test.case("four zero bytes are characters a code is not made of")
-    put32(f, 12, 0)
+    put32(var f, 12, 0)
     match ntppkt.kiss_of(ntppkt.decode(f, 0))
         Some(_) => test.assert(false)
         None    => test.assert(true)
 
     test.case("and a stratum above zero with a text id is not a kiss at all")
     f[1] = 2
-    put32(f, 12, GPS_ID)
+    put32(var f, 12, GPS_ID)
     match ntppkt.kiss_of(ntppkt.decode(f, 0))
         Some(_) => test.assert(false)
         None    => test.assert(true)
@@ -214,8 +214,8 @@ fn test_the_five_refusals_a_packet_can_carry() [io]
 
     test.case("a zero transmit timestamp is a server without a time")
     f[1] = 2
-    put32(f, 40, 0)
-    put32(f, 44, 0)
+    put32(var f, 40, 0)
+    put32(var f, 44, 0)
     match ntppkt.packet_fault(ntppkt.decode(f, 0))
         Some(NtpFaultZeroTransmit) => test.assert(true)
         Some(_)                    => test.assert(false)
@@ -250,11 +250,11 @@ fn test_the_buffer_checks_refuse_what_does_not_fit() [io]
 
     test.case("a buffer of exactly forty-eight bytes takes them all")
     var exact: [u8] = bytes.to_byte_list(bytes.zeros(48))
-    test.assert_eq(ntppkt.encode_into(exact, 0, req), 48)
+    test.assert_eq(ntppkt.encode_into(var exact, 0, req), 48)
 
     test.case("an offset past the end writes nothing rather than too much")
-    test.assert_eq(ntppkt.encode_into(exact, 1, req), 0)
-    test.assert_eq(ntppkt.encode_into(exact, -1, req), 0)
+    test.assert_eq(ntppkt.encode_into(var exact, 1, req), 0)
+    test.assert_eq(ntppkt.encode_into(var exact, -1, req), 0)
 
     test.case("and length is a claim the bytes have to back")
     test.assert(not ntppkt.is_wellformed(exact, 0, 47))

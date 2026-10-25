@@ -124,7 +124,7 @@ fn test_the_codec_writes_into_a_buffer_the_caller_sized() [io]
     // path allocates, which is what lets a device hold one.
     test.case("forty-eight bytes go into a forty-eight byte buffer")
     var out = [0, 0, 0, 0, 0, 0, 0, 0]
-    test.assert_eq(ntppkt.encode_into(out, 0, ntppkt.request(a_nonce())), 0)
+    test.assert_eq(ntppkt.encode_into(var out, 0, ntppkt.request(a_nonce())), 0)
 
     test.case("and a decode reads a packet back out of bytes")
     let p = ntppkt.decode(out, 0)

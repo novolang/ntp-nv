@@ -329,7 +329,7 @@ fn exchange_with(server: Str, request: NtpPacket,
     // only place a timeout is reported from.
     let _ = net.set_recv_timeout(sock, timeout_ms)
     var frame: [u8] = bytes.to_byte_list(bytes.zeros(ntppkt.NTP_PACKET_BYTES))
-    let _ = ntppkt.encode_into(frame, 0, request)
+    let _ = ntppkt.encode_into(var frame, 0, request)
     let precision_micros = clock_precision_micros()
     // `Str` and not `Bytes`: see the module comment and the CHANGELOG's
     // `### Known` entry.
