@@ -20,3 +20,8 @@ fn test_a_rate_kiss_still_doubles_below_the_ceiling() [io]
 fn test_a_pool_set_above_the_ceiling_keeps_its_interval() [io]
     let p = ntppool.pool(["a.example.org"], 200000, 3000)
     test.assert_eq(ntppool.after_kiss(p, "a.example.org", NtpKissRate).poll_seconds, 200000)
+
+@test
+fn test_a_rate_kiss_above_half_the_ceiling_stops_at_the_ceiling() [io]
+    let p = ntppool.pool(["a.example.org"], 100000, 3000)
+    test.assert_eq(ntppool.after_kiss(p, "a.example.org", NtpKissRate).poll_seconds, 131072)
