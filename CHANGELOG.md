@@ -5,11 +5,13 @@ All notable changes to ntp-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Fixed
 
 - Repeated `RATE` kisses back the poll interval off to at most 2^17 seconds instead of doubling it until the multiplication overflows.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-13
 
@@ -166,6 +168,10 @@ frozen signature had to move — `ntppkt.encode_into`'s buffer gains
   arithmetic it wraps is covered through `ntpcalc` directly and the
   codec through `ntppkt` directly, so what is unverified is the wiring
   and not the arithmetic.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
 
 ## 0.0.3 — 2026-09-28
 

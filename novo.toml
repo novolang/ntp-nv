@@ -30,7 +30,7 @@ category    = "networking"
 tags        = ["ntp", "sntp", "rfc4330", "rfc5905", "clock", "time-sync", "embedded"]
 repository  = "https://github.com/novolang/ntp-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.20.2"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
